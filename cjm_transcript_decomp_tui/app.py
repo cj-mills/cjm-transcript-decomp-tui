@@ -22,7 +22,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import Static
 
-from .runs import DecompIndex, group_by_text_from, SourceRunIndex
+from .runs import DecompIndex, group_batches, SourceRunIndex
 
 
 class DecompApp(App):
@@ -150,8 +150,10 @@ class DecompApp(App):
                        "transcription runs land here)\n", style="dim")
         batches = self._batches()
         panel = (2 + len(batches)) if self.picked else 0
-        budget = max(3, max(4, self.size.height - 1) - 4 - panel)
         self.cursor = max(0, min(self.cursor, max(0, len(runs) - 1)))
+        # Detail region (614dd647): up to 4 source rows + the graph-db line.
+        detail = (min(4, len(runs[self.cursor].get("sources") or [])) + 3) if runs else 0
+        budget = max(3, max(4, self.size.height - 1) - 4 - panel - detail)
         start, end, above, below = visible_slice(len(runs), self.cursor, budget)
         if above:
             out.append(f"   … {above} above\n", style="dim")
@@ -188,13 +190,50 @@ class DecompApp(App):
             out.append("\n")
         if below:
             out.append(f"   … {below} below\n", style="dim")
+        if runs:
+            # Focused-run detail (614dd647): WHAT was transcribed + WHICH graph
+            # it landed in, in-pane — identity must not need a round-trip to
+            # the transcription TUI.
+            focused = runs[self.cursor]
+            out.append("\n")
+            srcs = focused.get("sources") or []
+            for s in srcs[:4]:
+                nm = Path(str(s.get("source_path") or "?")).stem
+                row = Text()
+                row.append(f"   · {nm}", style="bold")
+                row.append(f"  {len(s.get('segments') or [])} seg", style="dim")
+                row.truncate(width, overflow="ellipsis")
+                out.append_text(row)
+                out.append("\n")
+            if len(srcs) > 4:
+                out.append(f"   … {len(srcs) - 4} more source(s)\n", style="dim")
+            db = self._resolved_graph_db(focused)
+            dbline = Text()
+            if db is None:
+                dbline.append("   ⚠ no graph db recorded in this manifest",
+                              style="bold red")
+            elif not Path(db).exists():
+                dbline.append(f"   ⚠ recorded graph db missing on disk: {tail(db, 40)}",
+                              style="bold red")
+            else:
+                dbline.append(f"   graph db: {tail(db, 48)}", style="dim cyan")
+            dbline.truncate(width, overflow="ellipsis")
+            out.append_text(dbline)
+            out.append("\n")
         if self.picked:
             out.append(f"\n Batch ({len(self.picked)} run(s) -> {len(batches)} "
                        f"invocation(s)):\n", style="bold")
-            for bi, (tf, paths) in enumerate(batches):
+            for bi, ((tf, db), paths) in enumerate(batches):
                 short = (tf or "?").removeprefix("cjm-capability-")
                 line = Text()
-                line.append(f"   {bi + 1}. text-from {short}: ", style="green")
+                line.append(f"   {bi + 1}. text-from {short}", style="green")
+                if db is None:
+                    line.append("  ⚠ no graph db recorded", style="bold red")
+                elif not Path(db).exists():
+                    line.append(f"  ⚠ db missing: {tail(db, 24)}", style="bold red")
+                else:
+                    line.append(f"  db {tail(db, 24)}", style="dim")
+                line.append(": ", style="green")
                 line.append(", ".join(self._run_id_for(p) for p in paths), style="dim")
                 line.truncate(width, overflow="ellipsis")
                 out.append_text(line)
@@ -294,13 +333,23 @@ class DecompApp(App):
         return (self.text_from.get(m["_path"])
                 or SourceRunIndex.default_text_from(m))
 
-    def _batches(self) -> List[Tuple[Optional[str], List[str]]]:
-        picks: List[Tuple[str, Optional[str]]] = []
+    def _resolved_graph_db(self, m: Dict[str, Any]) -> Optional[str]:
+        """Effective graph db for one run: the explicit override (flag/state)
+        wins, else the db the run RECORDED writing to (e087d059 — provenance-
+        following, never the decomp stack's own configured default)."""
+        return (self.graph_db_path
+                or SourceRunIndex.recorded_graph_db(m, self.graph_capability))
+
+    def _batches(self) -> List[Tuple[Tuple[Optional[str], Optional[str]], List[str]]]:
+        """The hand-off fold: key = (text_from, graph_db_path) — everything
+        that applies invocation-wide on the core CLI."""
+        picks: List[Tuple[str, Tuple[Optional[str], Optional[str]]]] = []
         for key in self.picked:
             m = self._run_by_path(key)
             if m is not None:
-                picks.append((key, self._resolved_text_from(m)))
-        return group_by_text_from(picks)
+                picks.append((key, (self._resolved_text_from(m),
+                                    self._resolved_graph_db(m))))
+        return group_batches(picks)
 
     def _reload_indexes(self) -> None:
         self.src_index.load()
@@ -415,9 +464,18 @@ class DecompApp(App):
             self.error = "pick at least one transcription run first"
             self._paint()
             return
+        for (tf, db), paths in self._batches():
+            if db is None:
+                # Proceeding without a db is the guaranteed-wrong-graph failure
+                # the first drive hit (e087d059) — block, don't warn.
+                self.error = (f"no graph db recorded for {self._run_id_for(paths[0])} "
+                              "— pass --graph-db-path to override")
+                self._paint()
+                return
         self.exit({
-            "batches": [{"text_from": tf, "manifests": list(paths)}
-                        for tf, paths in self._batches()],
+            "batches": [{"text_from": tf, "graph_db_path": db,
+                         "manifests": list(paths)}
+                        for (tf, db), paths in self._batches()],
             "runs_dir": str(self.src_index.runs_dir),
             "manifests_dir": self.manifests_dir,
             "sysmon_capability": self.sysmon_capability,

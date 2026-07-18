@@ -21,12 +21,18 @@ def write_corpus(runs_dir: Path) -> dict:
     single-transcriber run, and one decomp manifest consuming the multi run
     (the coverage-chip case). Returns the paths keyed for assertions."""
     runs_dir.mkdir(parents=True, exist_ok=True)
+    # A REAL on-disk db file: the recorded-db provenance (e087d059) paints
+    # warn-free and rides the confirmed plan only when the path exists.
+    db = runs_dir / "context_graph.db"
+    db.write_bytes(b"")
+    caps = {"cjm-capability-graph-sqlite": {"db_path": str(db)}}
     multi = runs_dir / "run_multi.json"
     multi.write_text(json.dumps({
         "format": "cjm-transcription-core/run-manifest", "version": "0.2.0",
         "run_id": "run_multi", "created_at": 200.0,
         "config": {"transcriber_capabilities": ["cjm-capability-solo",
                                                 "cjm-capability-acc"]},
+        "capabilities": caps,
         "sources": [{"source_path": "/tmp/a.mp3",
                      "segments": [{"index": 0}, {"index": 1}]}]}))
     single = runs_dir / "run_single.json"
@@ -34,6 +40,7 @@ def write_corpus(runs_dir: Path) -> dict:
         "format": "cjm-transcription-core/run-manifest", "version": "0.2.0",
         "run_id": "run_single", "created_at": 100.0,
         "config": {"transcriber_capabilities": ["cjm-capability-solo"]},
+        "capabilities": caps,
         "sources": [{"source_path": "/tmp/b.mp3", "segments": [{"index": 0}]}]}))
     (runs_dir / "decomp_x.json").write_text(json.dumps({
         "format": "cjm-transcript-decomp-core/run-manifest", "version": "0.2.1",
@@ -42,7 +49,7 @@ def write_corpus(runs_dir: Path) -> dict:
         "source_manifest": str(multi),
         "sources": [{"source_node_id": "abc12345ffff", "source_path": "/tmp/a.mp3",
                      "title": "a", "segment_count": 5, "segment_ids": []}]}))
-    return {"multi": str(multi), "single": str(single)}
+    return {"multi": str(multi), "single": str(single), "db": str(db)}
 
 
 async def drive_batch(runs_dir: Path, paths: dict) -> None:
@@ -64,11 +71,16 @@ async def drive_batch(runs_dir: Path, paths: dict) -> None:
         chip = str(app.query_one("#status", Static).render())
         assert "graph→cjm-capability-graph-sqlite" in chip, chip
 
+        # Focused-run detail (614dd647): source names + the recorded graph db.
+        assert "· a" in body and "graph db:" in body, body
+        assert "⚠" not in body, body                   # provenance complete: no warns
+
         await pilot.press("enter")                     # pick run_multi (newest first)
         assert app.picked == [paths["multi"]], app.picked
         body = paint()
         assert "[1]" in body and "1 invocation(s)" in body, body
-        assert "text-from acc: run_multi" in body, body
+        assert "text-from acc" in body and "run_multi" in body, body
+        assert "db " in body, body                     # the group's db paints (e087d059)
 
         await pilot.press("j")
         await pilot.press("enter")                     # pick run_single too
@@ -106,6 +118,7 @@ async def drive_batch(runs_dir: Path, paths: dict) -> None:
     plan = app.return_value
     assert plan is not None, "confirm returned no plan"
     assert plan["batches"] == [{"text_from": "cjm-capability-solo",
+                                "graph_db_path": paths["db"],
                                 "manifests": [paths["multi"], paths["single"]]}], plan
     print("pilot OK: pick order, t-cycle + grouping fold, coverage chip, "
           "results drill, confirmed plan")

@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from cjm_transcript_decomp_tui.cli import batch_argv, build_parser
 from cjm_transcript_decomp_tui.runs import (DecompIndex, SourceRunIndex,
-                                            group_by_text_from)
+                                            group_batches)
 
 
 def _src_manifest(run_id, created, transcribers):
@@ -67,25 +67,33 @@ def test_transcribers_and_default_text_from():
     assert SourceRunIndex.default_text_from({"config": {}}) is None
 
 
-def test_group_by_text_from_preserves_order():
-    groups = group_by_text_from([("m1", "acc"), ("m2", "solo"), ("m3", "acc")])
-    assert groups == [("acc", ["m1", "m3"]), ("solo", ["m2"])]
-    assert group_by_text_from([]) == []
+def test_group_batches_preserves_order():
+    # The key is (text_from, graph_db_path) — everything invocation-wide.
+    groups = group_batches([("m1", ("acc", "/g1.db")), ("m2", ("solo", "/g1.db")),
+                            ("m3", ("acc", "/g1.db")), ("m4", ("acc", "/g2.db"))])
+    assert groups == [(("acc", "/g1.db"), ["m1", "m3"]),
+                      (("solo", "/g1.db"), ["m2"]),
+                      (("acc", "/g2.db"), ["m4"])]  # same authority, other db: own group
+    assert group_batches([]) == []
 
 
 def test_batch_argv_renders_the_handoff():
-    args = build_parser().parse_args(["--force", "--actor", "tui:test"])
-    argv = batch_argv({"text_from": "cap-acc", "manifests": ["a.json", "b.json"]},
-                      args, "cjm-capability-monitor-nvidia", "/tmp/g.db")
+    args = build_parser().parse_args(["--runs-dir", "/data/runs", "--force",
+                                      "--actor", "tui:test"])
+    argv = batch_argv({"text_from": "cap-acc", "graph_db_path": "/tmp/g.db",
+                       "manifests": ["a.json", "b.json"]},
+                      args, "cjm-capability-monitor-nvidia")
     assert argv[:3] == ["run", "a.json", "b.json"]
     assert "--yes" in argv
     assert argv[argv.index("--text-from") + 1] == "cap-acc"
     assert argv[argv.index("--graph-db-path") + 1] == "/tmp/g.db"
     assert argv[argv.index("--sysmon-capability") + 1] == "cjm-capability-monitor-nvidia"
+    # 7dfd1177: decomp manifests pin to the SAME dir the TUI browsed.
+    assert argv[argv.index("--output-dir") + 1] == "/data/runs"
     assert "--force" in argv and "--actor" in argv
     # Optionals stay OUT when unset (a copy-pasteable minimal command).
-    bare = batch_argv({"text_from": None, "manifests": ["a.json"]},
-                      build_parser().parse_args([]), None, None)
+    bare = batch_argv({"text_from": None, "graph_db_path": None, "manifests": ["a.json"]},
+                      build_parser().parse_args([]), None)
     for flag in ("--text-from", "--graph-db-path", "--sysmon-capability",
                  "--force", "--actor"):
         assert flag not in bare
@@ -97,3 +105,16 @@ def test_parser_defaults():
     assert args.fa_capability == "cjm-capability-qwen3-forced-aligner"
     assert args.graph_capability == "cjm-capability-graph-sqlite"
     assert not args.plan_only and not args.no_sysmon and not args.force
+
+
+def test_provenance_reads():
+    # e087d059: the graph db derives from the manifest's capabilities block.
+    m = {"capabilities": {"cjm-capability-graph-sqlite": {"db_path": "/data/g.db"},
+                          "cjm-capability-whisper": {"db_path": None}},
+         "sources": [{"source_path": "/media/ep1.mp3", "segments": [{}]},
+                     {"source_path": "/media/ep2.mp3", "segments": []}]}
+    assert SourceRunIndex.recorded_graph_db(m, "cjm-capability-graph-sqlite") == "/data/g.db"
+    assert SourceRunIndex.recorded_graph_db(m, "cjm-capability-other") is None
+    assert SourceRunIndex.recorded_graph_db({}, "cjm-capability-graph-sqlite") is None
+    # 614dd647: source identity paints straight off the manifest.
+    assert SourceRunIndex.source_names(m) == ["ep1", "ep2"]

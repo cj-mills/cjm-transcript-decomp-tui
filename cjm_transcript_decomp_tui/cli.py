@@ -56,28 +56,32 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
 
 
 def batch_argv(
-    batch: Dict[str, Any],       # One confirmed group: {"text_from", "manifests"}
+    batch: Dict[str, Any],       # One confirmed group: {"text_from", "graph_db_path", "manifests"}
     args: argparse.Namespace,    # The TUI's parsed args (passthrough run options)
     sysmon: Optional[str],       # Resolved monitor capability (None = disabled)
-    graph_db_path: Optional[str],  # Resolved graph db override (None = capability default)
 ) -> List[str]:  # cjm-transcript-decomp-core argv (the reproducibility contract)
-    """Render one text-from group as headless decomp-core argv.
+    """Render one hand-off group as headless decomp-core argv.
 
     Everything the TUI decided (the ordered member manifests, the group's
-    authoritative transcriber) plus everything it merely passes through
+    authoritative transcriber, the group's graph db — the one the SOURCE runs
+    recorded writing to, e087d059) plus everything it merely passes through
     (capabilities, language, force, sysmon, actor) lands in ONE argv — printed
     before execution so any TUI-queued batch can be replayed by hand.
+    --output-dir pins decomp manifests to the SAME runs dir the TUI browsed
+    (7dfd1177: cwd-relative output blinded the results view and the coverage
+    chips).
     """
     argv = ["run", *batch["manifests"], "--yes",
             "--manifests-dir", args.manifests_dir,
             "--vad-capability", args.vad_capability,
             "--fa-capability", args.fa_capability,
             "--graph-capability", args.graph_capability,
-            "--language", args.language]
+            "--language", args.language,
+            "--output-dir", args.runs_dir]
     if batch.get("text_from"):
         argv += ["--text-from", batch["text_from"]]
-    if graph_db_path:
-        argv += ["--graph-db-path", graph_db_path]
+    if batch.get("graph_db_path"):
+        argv += ["--graph-db-path", batch["graph_db_path"]]
     if sysmon:
         argv += ["--sysmon-capability", sysmon]
     if args.force:
@@ -109,8 +113,7 @@ def main() -> int:  # Console-script entry point (cjm-transcript-decomp-tui)
                graph_db_path=plan["graph_db_path"])
     rc = 0
     for i, batch in enumerate(plan["batches"]):
-        argv = batch_argv(batch, args, plan["sysmon_capability"],
-                          plan["graph_db_path"])
+        argv = batch_argv(batch, args, plan["sysmon_capability"])
         print(f"batch {i + 1}/{len(plan['batches'])}: "
               + shlex.join(["cjm-transcript-decomp-core"] + argv))
         if args.plan_only:

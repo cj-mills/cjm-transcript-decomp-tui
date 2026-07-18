@@ -89,6 +89,29 @@ class SourceRunIndex:
         t = cls.transcribers(m)
         return t[-1] if t else None
 
+    @staticmethod
+    def recorded_graph_db(
+        m: Dict[str, Any],      # A transcription-run manifest
+        graph_capability: str,  # The graph capability's instance id
+    ) -> Optional[str]:  # The db this run recorded writing to (None = not recorded)
+        """The graph db the transcription run RECORDED writing to.
+
+        The manifest's capabilities block is the provenance (finding e087d059:
+        defaulting to the decomp stack's own configured db pointed the first
+        live batch at the WRONG graph — 'Source root not found'). None means a
+        pre-provenance or unjournaled run: the caller must WARN, never
+        silently default."""
+        cap = (m.get("capabilities") or {}).get(graph_capability) or {}
+        db = cap.get("db_path")
+        return str(db) if db else None
+
+    @staticmethod
+    def source_names(m: Dict[str, Any]) -> List[str]:  # Source display names, manifest order
+        """Path stems of the run's sources (finding 614dd647: a run row must
+        say WHAT was transcribed without a transcription-TUI round-trip)."""
+        return [Path(str(s.get("source_path") or "?")).stem
+                for s in m.get("sources") or []]
+
 
 class DecompIndex:
     """Decomp-core run manifests read back: coverage chips for the batch stage
@@ -124,23 +147,24 @@ class DecompIndex:
         return counts
 
 
-def group_by_text_from(
-    picks: List[Tuple[str, Optional[str]]],  # Ordered (manifest_path, resolved text_from) selection
-) -> List[Tuple[Optional[str], List[str]]]:  # (text_from, member paths) per hand-off invocation
+def group_batches(
+    picks: List[Tuple[str, Any]],  # Ordered (manifest_path, hand-off key) selection
+) -> List[Tuple[Any, List[str]]]:  # (key, member paths) per hand-off invocation
     """Fold an ordered batch selection into headless hand-off groups.
 
-    --text-from applies invocation-wide, so one core invocation per DISTINCT
-    text_from is the finest split that keeps the whole ergonomic win: every
-    manifest in a group rides the SAME loaded capability stack. Sole-transcriber
-    runs resolve to their sole transcriber (always valid against the core's
-    membership check), so they merge into a pair-run's group whenever the
-    authority model matches. First-seen order of groups and members preserves
-    the operator's queueing order."""
-    order: List[Optional[str]] = []
-    groups: Dict[Optional[str], List[str]] = {}
-    for path, tf in picks:
-        if tf not in groups:
-            groups[tf] = []
-            order.append(tf)
-        groups[tf].append(path)
-    return [(tf, groups[tf]) for tf in order]
+    The key is EVERYTHING that applies invocation-wide on the core CLI —
+    currently (text_from, graph_db_path): --text-from names one authority per
+    invocation, and --graph-db-path points one graph per invocation (finding
+    e087d059 — runs recorded against different dbs must not share a stack
+    config). One core invocation per DISTINCT key is the finest split that
+    keeps the ergonomic win: every manifest in a group rides the SAME loaded
+    capability stack. First-seen order of groups and members preserves the
+    operator's queueing order."""
+    order: List[Any] = []
+    groups: Dict[Any, List[str]] = {}
+    for path, key in picks:
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(path)
+    return [(key, groups[key]) for key in order]

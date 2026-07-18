@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cjm-transcript-decomp-tui"
+version = "0.0.1"
+description = "Decomp-batch TUI driver: browse transcription-core run manifests, queue an ordered multi-run batch with per-run authoritative-text picks, then hand off to cjm-transcript-decomp-core's headless batch runner (one capability stack for the whole batch). Born on-graph."
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "Apache-2.0"}
+authors = [{name = "Christian J. Mills", email = "9126128+cj-mills@users.noreply.github.com"}]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+]
+dependencies = [
+    'cjm-substrate-tui-kit>=0.0.1',
+    'cjm-transcript-decomp-core>=0.0.3',
+    'textual',
+]
+
+[project.scripts]
+cjm-transcript-decomp-tui = "cjm_transcript_decomp_tui.cli:main"
+
+[project.urls]
+Repository = "https://github.com/cj-mills/cjm-transcript-decomp-tui"
+
+[tool.setuptools.packages.find]
+include = ["cjm_transcript_decomp_tui*"]

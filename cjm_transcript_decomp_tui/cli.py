@@ -5,9 +5,11 @@ before execution — TUI-queued batches stay reproducible by copy-paste — and
 --plan-only stops at the printout."""
 
 import argparse
+import os
 import shlex
 from typing import Any, Dict, List, Optional
 
+from cjm_substrate.core.workspace import resolve_workspace
 from cjm_transcript_decomp_core.cli import main as core_main
 
 from .app import DecompApp
@@ -24,10 +26,16 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
                     "authoritative-text choices), then hand off to "
                     "cjm-transcript-decomp-core's batch runner — one loaded "
                     "capability stack per text-from group.")
-    p.add_argument("--runs-dir", default="runs",
-                   help="Run-manifest directory (BOTH cores' cwd-relative default)")
-    p.add_argument("--manifests-dir", default=".cjm/manifests",
-                   help="Capability manifests directory")
+    p.add_argument("--workspace", default=None,
+                   help="Workspace root (5daadfc4; default: CJM_WORKSPACE env, else upward walk "
+                        "from cwd). Supplies runs/manifests defaults and is exported so the "
+                        "core hand-off + capability workers resolve workspace-scoped paths")
+    p.add_argument("--runs-dir", default=None,
+                   help="Run-manifest directory (default: the workspace's runs/ when one is "
+                        "active, else runs/ under the cwd — both cores' legacy default)")
+    p.add_argument("--manifests-dir", default=None,
+                   help="Capability manifests directory (default: the workspace's "
+                        ".cjm/manifests when one is active, else .cjm/manifests under the cwd)")
     p.add_argument("--vad-capability", default="cjm-capability-silero-vad",
                    help="VAD capability name (forwarded to the core)")
     p.add_argument("--fa-capability", default="cjm-capability-qwen3-forced-aligner",
@@ -95,6 +103,16 @@ def main() -> int:  # Console-script entry point (cjm-transcript-decomp-tui)
     """Resolve settings (flags > persisted state > manifest discovery), run the
     batch app, persist the confirmed choices, then print + run each group."""
     args = build_parser().parse_args()
+    # 5daadfc4 workspace: resolve before anything reads paths; export so the
+    # in-process core hand-off + capability workers are workspace-scoped.
+    ws = resolve_workspace(explicit=args.workspace)
+    if ws is not None:
+        os.environ["CJM_WORKSPACE"] = str(ws.root)
+    if args.manifests_dir is None:
+        args.manifests_dir = (str(ws.substrate_data_dir / "manifests")
+                              if ws is not None else ".cjm/manifests")
+    if args.runs_dir is None:
+        args.runs_dir = str(ws.runs_dir) if ws is not None else "runs"
     state = load_state(args.manifests_dir)
     sysmon = None if args.no_sysmon else (
         args.sysmon_capability or state.get("sysmon_capability")

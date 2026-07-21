@@ -101,7 +101,11 @@ def test_batch_argv_renders_the_handoff():
 
 def test_parser_defaults():
     args = build_parser().parse_args([])
-    assert args.runs_dir == "runs"
+    # 5daadfc4: None sentinels — main() resolves the workspace's runs/ +
+    # .cjm/manifests when one is active, else the legacy cwd-relative defaults
+    assert args.runs_dir is None
+    assert args.manifests_dir is None
+    assert args.workspace is None
     assert args.fa_capability == "cjm-capability-qwen3-forced-aligner"
     assert args.graph_capability == "cjm-capability-graph-sqlite"
     assert not args.plan_only and not args.no_sysmon and not args.force

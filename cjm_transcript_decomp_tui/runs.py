@@ -12,6 +12,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from cjm_substrate.core.workspace import resolve_recorded_tree
+
 
 def _load_manifests(
     runs_dir: Path,   # Directory holding both cores' run manifests
@@ -32,7 +34,9 @@ def _load_manifests(
         files = []
     for f in files:
         try:
-            m = json.loads(f.read_text())
+            # ${WS}/ recorded paths (5daadfc4 rung f) resolve at load,
+            # anchored at the manifest's own location.
+            m = resolve_recorded_tree(json.loads(f.read_text()), f)
         except (OSError, ValueError):
             continue
         if not (isinstance(m, dict) and m.get("run_id")

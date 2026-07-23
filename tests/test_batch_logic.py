@@ -122,3 +122,16 @@ def test_provenance_reads():
     assert SourceRunIndex.recorded_graph_db({}, "cjm-capability-graph-sqlite") is None
     # 614dd647: source identity paints straight off the manifest.
     assert SourceRunIndex.source_names(m) == ["ep1", "ep2"]
+
+
+def test_batch_argv_sentence_split_passthrough():
+    # The batch-level split toggle (s in RUNS, or --sentence-split) renders into
+    # the hand-off argv with its guard; off = absent (copy-pasteable minimal).
+    args = build_parser().parse_args(["--sentence-split", "--split-min-chunk-s", "0.7"])
+    argv = batch_argv({"text_from": None, "graph_db_path": None,
+                       "manifests": ["a.json"]}, args, None)
+    assert "--sentence-split" in argv
+    assert argv[argv.index("--split-min-chunk-s") + 1] == "0.7"
+    off = batch_argv({"text_from": None, "graph_db_path": None,
+                      "manifests": ["a.json"]}, build_parser().parse_args([]), None)
+    assert "--sentence-split" not in off and "--split-min-chunk-s" not in off

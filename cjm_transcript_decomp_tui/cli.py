@@ -53,10 +53,21 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
                    help="Explicitly disable the monitor (overrides state + discovery)")
     p.add_argument("--language", default="English",
                    help="Forced-alignment language (forwarded to the core)")
+    p.add_argument("--sentence-split", action="store_true",
+                   help="Run every confirmed group with the post-FA sentence-split "
+                        "stage (forwarded to the core; commits a PARALLEL spine). "
+                        "Also toggleable in-TUI with s on the runs stage")
+    p.add_argument("--split-min-chunk-s", type=float, default=0.5,
+                   help="Sentence-split min sub-chunk duration guard, seconds "
+                        "(forwarded to the core; identity input)")
     p.add_argument("--force", action="store_true",
                    help="Bypass capability-side caches (forwarded to the core)")
     p.add_argument("--actor", default=None,
                    help="Forwarded journal attribution (default: cli:<user>)")
+    p.add_argument("--gap-threshold", type=float, default=2.0,
+                   help="Seconds of uncovered span between committed fine "
+                        "segments that paints a gap row in the segments drill "
+                        "(a chunk VAD never cut shows only as a gap)")
     p.add_argument("--plan-only", action="store_true",
                    help="Print each group's equivalent headless command and exit "
                         "WITHOUT running anything")
@@ -94,6 +105,8 @@ def batch_argv(
         argv += ["--sysmon-capability", sysmon]
     if args.force:
         argv += ["--force"]
+    if args.sentence_split:
+        argv += ["--sentence-split", "--split-min-chunk-s", str(args.split_min_chunk_s)]
     if args.actor:
         argv += ["--actor", args.actor]
     return argv
@@ -121,7 +134,9 @@ def main() -> int:  # Console-script entry point (cjm-transcript-decomp-tui)
     app = DecompApp(args.manifests_dir, runs_dir=args.runs_dir,
                     sysmon_capability=sysmon,
                     graph_capability=args.graph_capability,
-                    graph_db_path=graph_db_path)
+                    graph_db_path=graph_db_path,
+                    gap_threshold=args.gap_threshold,
+                    sentence_split=args.sentence_split)
     plan = app.run()
     if not plan:
         print("no batch confirmed")
@@ -129,6 +144,8 @@ def main() -> int:  # Console-script entry point (cjm-transcript-decomp-tui)
     save_state(args.manifests_dir,
                sysmon_capability=plan["sysmon_capability"],
                graph_db_path=plan["graph_db_path"])
+    # The in-TUI s toggle wins over the launch flag (the hub path has no flags).
+    args.sentence_split = bool(plan.get("sentence_split"))
     rc = 0
     for i, batch in enumerate(plan["batches"]):
         argv = batch_argv(batch, args, plan["sysmon_capability"])

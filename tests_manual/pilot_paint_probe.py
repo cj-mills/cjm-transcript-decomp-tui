@@ -45,11 +45,25 @@ def write_corpus(runs_dir: Path) -> dict:
     (runs_dir / "decomp_x.json").write_text(json.dumps({
         "format": "cjm-transcript-decomp-core/run-manifest", "version": "0.2.1",
         "run_id": "decomp_x", "created_at": 300.0,
-        "config": {"text_from": "cjm-capability-acc"},
+        "config": {"text_from": "cjm-capability-acc",
+                   "vad_capability": "cjm-capability-vad"},
         "source_manifest": str(multi),
+        "capabilities": {**caps, "cjm-capability-vad": {
+            "config": {"threshold": 0.5, "min_silence_duration_ms": 100}}},
         "sources": [{"source_node_id": "abc12345ffff", "source_path": "/tmp/a.mp3",
-                     "title": "a", "segment_count": 5, "segment_ids": []}]}))
-    return {"multi": str(multi), "single": str(single), "db": str(db)}
+                     "title": "a", "segment_count": 5,
+                     "segment_ids": ["sa", "sb", "sc"]}]}))
+    mdir = runs_dir / "manifests"
+    mdir.mkdir()
+    (mdir / "cjm-capability-vad.json").write_text(json.dumps({
+        "code": {"name": "cjm-capability-vad", "config_schema": {"properties": {
+            "threshold": {"type": "number", "title": "Threshold",
+                          "minimum": 0.0, "maximum": 1.0, "default": 0.5},
+            "min_silence_duration_ms": {"type": "integer",
+                                        "title": "Min Silence (ms)",
+                                        "default": 100}}}}}))
+    return {"multi": str(multi), "single": str(single), "db": str(db),
+            "manifests": str(mdir)}
 
 
 async def drive_batch(runs_dir: Path, paths: dict) -> None:
@@ -105,10 +119,79 @@ async def drive_batch(runs_dir: Path, paths: dict) -> None:
         body = paint()
         assert "Decomp runs (1)" in body and "decomp_x" in body, body[:400]
         assert "5 seg" in body and "tf=acc" in body, body
+        assert "5 seg  a  tf=acc" in body, body        # source titles in-row
         await pilot.press("enter")                     # drill
         body = paint()
         assert "5 fine segment(s)" in body, body[:400]
         assert "Source abc12345" in body, body
+
+        # Segments drill (166dd2b8 half a) over a STUBBED seat — the pilot
+        # verifies paint (gap rows, shortfall chip, VAD summary), not plumbing.
+        class FakeSegmentStack:
+            db_path = None
+            async def open(self, db_path):
+                self.db_path = db_path
+            async def read_segments(self, segment_ids):
+                return [{"id": "sa", "index": 0, "start_time": 12.0,
+                         "end_time": 15.0, "text": "first segment text",
+                         "rendition_id": "rendA"},
+                        {"id": "sb", "index": 1, "start_time": 15.2,
+                         "end_time": 20.0, "text": "second segment text",
+                         "rendition_id": "rendA"}]
+            async def read_audio_join(self, source_id, rendition_ids):
+                return [{"start": 0.0, "end": 60.0, "wav": "fake.wav",
+                         "rendition": "rendA"}]
+            async def probe_vad(self, vad_capability, config, wav_path):
+                return [(0.5, 10.0), (11.9, 15.1), (15.3, 20.1)]
+            async def read_transcript_text(self, rendition_id, transcriber):
+                return "first segment text second segment text extra tail words"
+            async def probe_fa(self, fa_capability, config, wav_path, text):
+                return [("first", 0.6, 1.0), ("segment", 1.1, 1.5),
+                        ("text", 1.6, 2.0), ("second", 12.0, 12.4),
+                        ("segment", 12.5, 13.0), ("text", 13.1, 13.5),
+                        ("extra", 15.4, 15.8), ("tail", 16.0, 16.4),
+                        ("words", 16.5, 16.9)]
+            async def close(self):
+                self.db_path = None
+        app._seg_stack = FakeSegmentStack()
+        await pilot.press("enter")                     # source row -> segments
+        await pilot.pause()
+        assert app.stage == "segments", app.stage
+        body = paint()
+        assert "⚠ 12.0s gap" in body, body             # leading gap (de994164 class)
+        assert "first segment text" in body, body
+        assert "vad: thr 0.5 · min-sil 100ms" in body, body
+        assert "1 id(s) not in graph" in body, body    # sc dropped -> shortfall says so
+        assert "uncovered span" in body, body          # gap detail (cursor starts on it)
+        await pilot.press("c")                         # vad form: manifests dir absent
+        chip = str(app.query_one("#status", Static).render())
+        assert "no config_schema" in chip, chip
+        assert app.stage == "segments", app.stage      # refusal stays put
+
+        app.manifests_dir = paths["manifests"]         # now the schema resolves
+        await pilot.press("c")
+        assert app.stage == "vadform", app.stage
+        body = paint()
+        assert "Threshold" in body, body
+        await pilot.press("p")                         # probe over the stub seat
+        await pilot.pause()
+        body = paint()
+        # (11.9-15.1 clips the leading gap too -> BOTH probe chunks recover)
+        assert "predicted 3 chunk(s) vs 2 committed · 2 recovered" in body, body
+        await pilot.press("v")                         # walk the predicted skeleton
+        assert app.stage == "probeview", app.stage
+        body = paint()
+        assert "predicted skeleton" in body, body
+        assert "text FA-realigned" in body, body       # the pipeline's own fold ran
+        assert "first segment text" in body, body      # realigned chunk 0
+        # Realigned text no committed row carries — the borrow could never show this.
+        assert "extra tail words" in body, body
+        await pilot.press("b")                         # skeleton -> form
+        assert app.stage == "vadform", app.stage
+        await pilot.press("b")                         # form -> segments
+        assert app.stage == "segments", app.stage
+        await pilot.press("b")                         # segments -> drilled
+        assert app.stage == "results", app.stage
         await pilot.press("b")                         # drilled -> list
         assert app.results_run is None
         await pilot.press("b")                         # list -> runs
@@ -121,7 +204,8 @@ async def drive_batch(runs_dir: Path, paths: dict) -> None:
                                 "graph_db_path": paths["db"],
                                 "manifests": [paths["multi"], paths["single"]]}], plan
     print("pilot OK: pick order, t-cycle + grouping fold, coverage chip, "
-          "results drill, confirmed plan")
+          "results drill, segments drill (gap rows + shortfall + VAD summary), "
+          "confirmed plan")
 
 
 async def drive_windowing(runs_dir: Path) -> None:

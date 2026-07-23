@@ -15,14 +15,19 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from cjm_substrate_tui_kit.audio import ChunkPlayer, load_chunk
+from cjm_substrate_tui_kit.form import ConfigForm
 from cjm_substrate_tui_kit.repaint import RepaintThrottle
 from cjm_substrate_tui_kit.viewport import tail, visible_slice
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.widgets import Static
+from textual.widgets import Input, Static
 
 from .runs import DecompIndex, group_batches, SourceRunIndex
+from .segments import (aseg_index_for, build_display, capability_config_schema, fmt_ts, locate_span,
+                       predicted_rows, probe_compare, realign_rows, SegmentStack, split_predicted,
+                       vad_summary)
 
 
 class DecompApp(App):
@@ -62,6 +67,14 @@ class DecompApp(App):
         Binding("r", "reload", "reload"),
         Binding("n", "confirm", "confirm batch"),
         Binding("b", "back", "back"),
+        Binding("c", "vad_config", "vad config"),
+        Binding("p", "probe", "probe"),
+        Binding("s", "toggle_split", "split preview", show=False),
+        Binding("left_square_bracket", "speed_down", "slower", show=False,
+                key_display="["),
+        Binding("right_square_bracket", "speed_up", "faster", show=False,
+                key_display="]"),
+        Binding("escape", "stop_audio", "stop", show=False, priority=True),
         Binding("q", "quit_app", "quit"),
     ]
 
@@ -71,7 +84,9 @@ class DecompApp(App):
                  *, runs_dir: str = "runs",         # Both cores' cwd-relative manifest dir
                  sysmon_capability: Optional[str] = None,  # Monitor for GPU attribution (CR-7)
                  graph_capability: str = "cjm-capability-graph-sqlite",  # Extension target
-                 graph_db_path: Optional[str] = None):     # Caller-wins graph db override
+                 graph_db_path: Optional[str] = None,      # Caller-wins graph db override
+                 gap_threshold: float = 2.0,               # Seconds of uncovered span that paints a gap row
+                 sentence_split: bool = False):            # Seed the batch-level split toggle (--sentence-split)
         super().__init__()
         self.manifests_dir = manifests_dir
         self.sysmon_capability = sysmon_capability
@@ -89,6 +104,52 @@ class DecompApp(App):
         self.results_run: Optional[int] = None  # None = decomp list; else drilled index
         self.results_cursor = 0
         self.results_src = 0
+        self.gap_threshold = gap_threshold
+        # Segments drill (166dd2b8 half a): a lazy READ-ONLY graph seat reads
+        # the drilled source's committed fine spine back; entries interleave
+        # focusable gap rows (de994164 — the miss class lives BETWEEN rows).
+        self._seg_stack: Optional[SegmentStack] = None
+        self.seg_rows: List[Dict[str, Any]] = []
+        self.seg_display: List[Tuple[str, int, float]] = []
+        self.seg_cursor = 0
+        self.seg_title = ""
+        self.seg_vad: Optional[str] = None
+        self.seg_missing = 0
+        self.seg_source_id = ""
+        self.seg_vad_id = "cjm-capability-silero-vad"
+        self.seg_vad_cfg: Dict[str, Any] = {}
+        self.seg_fa_id = "cjm-capability-qwen3-forced-aligner"
+        self.seg_fa_cfg: Dict[str, Any] = {}
+        self.seg_text_from = ""
+        self.seg_asegs: List[Dict[str, Any]] = []
+        # Audio + probe (drive feedback 2026-07-22): r auditions the focused
+        # span — gaps INCLUDED, their audio exists only in the coarse WAVs —
+        # and the c-form probes VAD configs against the committed skeleton
+        # (166dd2b8 half b, probe-only per ee4a4b9c).
+        self.player: Optional[ChunkPlayer] = None
+        self.speed = 1.0
+        self.vad_form: Optional[ConfigForm] = None
+        self.form_cursor = 0
+        self.form_editing = False
+        self.probe_aseg: Optional[int] = None
+        self.probe_result: Optional[Dict[str, Any]] = None
+        self.probe_busy = False
+        # Sentence-split preview (DEC f1024568 deliverable d): s toggles the
+        # pipeline's own split stage over the probed skeleton — the view shows
+        # what a --sentence-split re-decomposition would commit, pre-commit.
+        self.probe_split = False
+        # Batch-level sentence-split (s in RUNS): rides the confirmed plan into
+        # the core hand-off as --sentence-split — the hub-launch path's only
+        # way to enable the split stage (no flags survive the hub's exec).
+        self.sentence_split = sentence_split
+        self._probe_ctx: Optional[Tuple[Dict[str, Any], List[Tuple[float, float]],
+                                        Optional[str],
+                                        Optional[List[Tuple[str, float, float]]]]] = None
+        # Probe-skeleton view (drive feedback: counts alone cannot answer
+        # "worth a re-decomposition?" — the predicted skeleton must WALK).
+        self.probe_view_rows: List[Dict[str, Any]] = []
+        self.probe_view_display: List[Tuple[str, int, float]] = []
+        self.probe_view_cursor = 0
         self.error: Optional[str] = None
         self.notice: Optional[str] = None
         self._throttle = RepaintThrottle(self._paint_now, self.set_timer,
@@ -97,6 +158,11 @@ class DecompApp(App):
     def compose(self) -> ComposeResult:
         yield Static(id="main")
         yield Static(id="status")
+        # Transient value-entry Input for the VAD form's open fields
+        # (transcription-TUI escape-hatch precedent); hidden until opened.
+        editor = Input(id="editor")
+        editor.display = False
+        yield editor
 
     def on_mount(self) -> None:
         self._reload_indexes()
@@ -113,7 +179,10 @@ class DecompApp(App):
 
     def _paint_now(self) -> None:
         pane = {"runs": self._paint_runs,
-                "results": self._paint_results}[self.stage]()
+                "results": self._paint_results,
+                "segments": self._paint_segments,
+                "vadform": self._paint_vadform,
+                "probeview": self._paint_probeview}[self.stage]()
         self.query_one("#main", Static).update(pane)
         status = Text()
         # Decomp ALWAYS journals — extension IS graph writing — so the chip
@@ -128,10 +197,13 @@ class DecompApp(App):
             status.append(f" {self.notice} ", style="cyan")
         else:
             hints = {
-                "runs": "enter/space pick · t text-from · v decomp runs · r reload · n confirm · q quit",
+                "runs": "enter/space pick · t text-from · s split · v decomp runs · r reload · n confirm · q quit",
                 "results": ("enter open run · j/k walk · b back · q quit"
                             if self.results_run is None
-                            else "j/k source · b decomp list · q quit"),
+                            else "enter segments · j/k source · b decomp list · q quit"),
+                "segments": "j/k walk · r play · [ ] speed · c vad config · b back · q quit",
+                "vadform": "j/k field · enter cycle/edit · p probe · s split · v skeleton · b back · q quit",
+                "probeview": "j/k walk · r play · s split · b form · q quit",
             }[self.stage]
             status.append(f" {self.stage.upper()}  ·  {hints}", style="dim")
         status.truncate(max(20, self.size.width), overflow="ellipsis")
@@ -222,7 +294,10 @@ class DecompApp(App):
             out.append("\n")
         if self.picked:
             out.append(f"\n Batch ({len(self.picked)} run(s) -> {len(batches)} "
-                       f"invocation(s)):\n", style="bold")
+                       f"invocation(s))", style="bold")
+            if self.sentence_split:
+                out.append("  ✂ sentence-split ON", style="bold magenta")
+            out.append(":\n", style="bold")
             for bi, ((tf, db), paths) in enumerate(batches):
                 short = (tf or "?").removeprefix("cjm-capability-")
                 line = Text()
@@ -267,6 +342,12 @@ class DecompApp(App):
                 segs = sum(int(s.get("segment_count") or 0) for s in srcs)
                 line.append(str(m["run_id"]), style="bold" if focus else "")
                 line.append(f"  {when}  {len(srcs)} source(s) · {segs} seg", style="dim")
+                # Source titles in-row (614dd647 extended to the decomp list —
+                # identity must not need a drill now the segments view is live).
+                names = [str(s.get("title") or "?") for s in srcs]
+                if names:
+                    extra = f" +{len(names) - 2}" if len(names) > 2 else ""
+                    line.append("  " + ", ".join(names[:2]) + extra, style="dim cyan")
                 tf = (m.get("config") or {}).get("text_from")
                 if tf:
                     line.append(f"  tf={str(tf).removeprefix('cjm-capability-')}",
@@ -314,6 +395,247 @@ class DecompApp(App):
             out.append(f"   … {below} below\n", style="dim")
         return out
 
+    def _paint_segments(self) -> Text:
+        """The drilled source's committed fine spine + interleaved gap rows.
+
+        Gap rows are FOCUSABLE (build_display): the gap is the inspection
+        target here — its detail names the exact uncovered span to audition
+        against the source (de994164)."""
+        width = max(20, self.size.width)
+        out = Text()
+        head = Text()
+        head.append(f" {self.seg_title}", style="bold")
+        head.append(f"  ·  {len(self.seg_rows)} fine segment(s)", style="dim")
+        gaps = sum(1 for kind, _, _ in self.seg_display if kind == "gap")
+        if gaps:
+            head.append(f"  ·  {gaps} gap(s) ≥{self.gap_threshold:g}s", style="bold yellow")
+        if self.seg_missing:
+            head.append(f"  ·  {self.seg_missing} id(s) not in graph", style="bold red")
+        head.truncate(width, overflow="ellipsis")
+        out.append_text(head)
+        out.append("\n")
+        if self.seg_vad:
+            vline = Text()
+            vline.append(f"   {self.seg_vad}", style="dim cyan")
+            vline.truncate(width, overflow="ellipsis")
+            out.append_text(vline)
+            out.append("\n")
+        out.append("\n")
+        entries = self.seg_display
+        if not entries:
+            out.append("   (no committed segments found in the graph)\n", style="dim")
+            return out
+        self.seg_cursor = max(0, min(self.seg_cursor, len(entries) - 1))
+        # 4 fixed detail lines below the list (focused-entry expansion).
+        budget = max(3, max(4, self.size.height - 1) - 8)
+        start, end, above, below = visible_slice(len(entries), self.seg_cursor, budget)
+        if above:
+            out.append(f"   … {above} above\n", style="dim")
+        for i in range(start, end):
+            kind, ri, secs = entries[i]
+            focus = (i == self.seg_cursor)
+            line = Text()
+            line.append(" > " if focus else "   ", style="bold cyan" if focus else "dim")
+            r = self.seg_rows[ri]
+            if kind == "gap":
+                s = float(r.get("start_time") or 0.0)
+                line.append(f"⚠ {secs:.1f}s gap", style="bold yellow")
+                line.append(f"  {fmt_ts(s - secs)} → {fmt_ts(s)}  no segment was cut here",
+                            style="yellow" if focus else "dim")
+            else:
+                s, e = r.get("start_time"), r.get("end_time")
+                span = (f"{fmt_ts(float(s))}–{fmt_ts(float(e))}"
+                        if s is not None and e is not None else "?–?")
+                line.append(f"{int(r.get('index') or ri):>4} ", style="bold" if focus else "dim")
+                line.append(f" {span}  ", style="dim")
+                line.append(str(r.get("text") or "").replace("\n", " "))
+            line.truncate(width, overflow="ellipsis")
+            out.append_text(line)
+            out.append("\n")
+        if below:
+            out.append(f"   … {below} below\n", style="dim")
+        # Focused-entry detail: the full text a one-line row truncated, or a
+        # gap's exact uncovered span (the check-the-source pointer).
+        kind, ri, secs = entries[self.seg_cursor]
+        r = self.seg_rows[ri]
+        out.append("\n")
+        if kind == "gap":
+            s = float(r.get("start_time") or 0.0)
+            out.append(f"   uncovered span {fmt_ts(s - secs)} → {fmt_ts(s)} "
+                       f"({secs:.1f}s) — audition the source audio here\n",
+                       style="yellow")
+        else:
+            s, e = r.get("start_time"), r.get("end_time")
+            if s is not None and e is not None:
+                out.append(f"   {fmt_ts(float(s))} → {fmt_ts(float(e))} · "
+                           f"{float(e) - float(s):.1f}s\n", style="dim cyan")
+            text = str(r.get("text") or "").replace("\n", " ")
+            w = max(10, width - 4)
+            for j in range(0, min(len(text), 3 * w), w):
+                out.append(f"   {text[j:j + w]}\n")
+        return out
+
+    def _paint_vadform(self) -> Text:
+        """The VAD config form + probe readout (166dd2b8 half b, probe-only).
+
+        Rows come from the capability's manifest config_schema (kit ConfigForm,
+        the f4a9d253 keystone) seeded with the RUN's recorded config; p sweeps
+        the frozen target chunk and paints what the config WOULD cut vs the
+        committed skeleton — recovered uncovered spans are the de994164 answer."""
+        width = max(20, self.size.width)
+        out = Text()
+        head = Text()
+        head.append(" VAD probe · ", style="bold")
+        head.append(self.seg_vad_id.removeprefix("cjm-capability-"), style="bold cyan")
+        head.append(f"  ·  {self.seg_title}", style="dim")
+        head.truncate(width, overflow="ellipsis")
+        out.append_text(head)
+        out.append("\n")
+        out.append("   probe-only: nothing commits — a promising sweep argues an "
+                   "explicit re-decomposition\n", style="dim")
+        out.append("   sentence-split preview: ", style="dim")
+        out.append("ON" if self.probe_split else "off",
+                   style="bold magenta" if self.probe_split else "dim")
+        out.append("  (s toggles — the pipeline's post-FA split stage over the "
+                   "predicted skeleton)\n\n", style="dim")
+        fields = self.vad_form.fields if self.vad_form is not None else []
+        for i, f in enumerate(fields):
+            focus = (i == self.form_cursor)
+            line = Text()
+            line.append(" > " if focus else "   ", style="bold cyan" if focus else "dim")
+            line.append(f"{f.title:<26}", style="bold" if focus else "")
+            base = self.seg_vad_cfg.get(f.key, f.default)
+            line.append(f.render(), style="yellow" if f.value != base else "")
+            if f.value != base:
+                line.append(f"  run: {base}", style="dim cyan")
+            line.truncate(width, overflow="ellipsis")
+            out.append_text(line)
+            out.append("\n")
+        out.append("\n")
+        if self.probe_aseg is not None and self.seg_asegs:
+            a = self.seg_asegs[self.probe_aseg]
+            tgt = Text()
+            tgt.append(f"   target: coarse chunk {self.probe_aseg + 1}/"
+                       f"{len(self.seg_asegs)} · {fmt_ts(a['start'])} → "
+                       f"{fmt_ts(a['end'])}", style="dim")
+            if not a.get("wav"):
+                tgt.append("  ⚠ no model-input WAV on disk", style="bold red")
+            tgt.truncate(width, overflow="ellipsis")
+            out.append_text(tgt)
+            out.append("\n")
+        if self.probe_busy:
+            out.append("   probing …\n", style="cyan")
+        elif self.probe_result is not None:
+            r = self.probe_result
+            out.append(f"   predicted {r['predicted']} chunk(s) vs {r['committed']} "
+                       f"committed · {len(r['recovered'])} recovered span(s)\n",
+                       style="bold")
+            for s, e in r["recovered"][:8]:
+                out.append(f"     + {fmt_ts(s)} → {fmt_ts(e)}  ({e - s:.1f}s) — "
+                           "was uncovered\n", style="green")
+            if len(r["recovered"]) > 8:
+                out.append(f"     … {len(r['recovered']) - 8} more\n", style="dim")
+        return out
+
+    def _paint_probeview(self) -> Text:
+        """WALK the last probe's predicted skeleton (v from the form).
+
+        Painted with the SEGMENTS grammar so the comparison is direct: same
+        rows, same interleaved gap markers (holes the predicted skeleton would
+        STILL leave), text borrowed from overlapping committed segments for
+        orientation, recovered chunks green — and r auditions any of them
+        before a re-decomposition is ever committed (probe-only, ee4a4b9c)."""
+        width = max(20, self.size.width)
+        out = Text()
+        head = Text()
+        head.append(" predicted skeleton", style="bold")
+        diffs = []
+        for f in (self.vad_form.fields if self.vad_form is not None else []):
+            base = self.seg_vad_cfg.get(f.key, f.default)
+            if f.value != base:
+                diffs.append(f"{f.key}={f.render()}")
+        head.append("  ·  " + ("; ".join(diffs) if diffs else "run config"),
+                    style="yellow" if diffs else "dim")
+        if self.probe_aseg is not None and self.seg_asegs:
+            a = self.seg_asegs[self.probe_aseg]
+            head.append(f"  ·  chunk {self.probe_aseg + 1}: "
+                        f"{fmt_ts(a['start'])} → {fmt_ts(a['end'])}", style="dim")
+        head.truncate(width, overflow="ellipsis")
+        out.append_text(head)
+        out.append("\n")
+        if self.probe_result is not None:
+            r = self.probe_result
+            realigned = bool(self.probe_view_rows
+                             and self.probe_view_rows[0].get("realigned"))
+            tag = ("text FA-realigned — what a re-decomposition would commit"
+                   if realigned else
+                   "text borrowed from committed rows (FA realign unavailable)")
+            out.append(f"   predicted {r['predicted']} vs {r['committed']} committed "
+                       f"· {len(r['recovered'])} recovered · {tag}\n", style="dim")
+        out.append("\n")
+        entries = self.probe_view_display
+        if not entries:
+            out.append("   (probe predicted no chunks)\n", style="dim")
+            return out
+        self.probe_view_cursor = max(0, min(self.probe_view_cursor, len(entries) - 1))
+        budget = max(3, max(4, self.size.height - 1) - 8)
+        start, end, above, below = visible_slice(len(entries), self.probe_view_cursor,
+                                                 budget)
+        if above:
+            out.append(f"   … {above} above\n", style="dim")
+        for i in range(start, end):
+            kind, ri, secs = entries[i]
+            focus = (i == self.probe_view_cursor)
+            line = Text()
+            line.append(" > " if focus else "   ", style="bold cyan" if focus else "dim")
+            row = self.probe_view_rows[ri]
+            if kind == "gap":
+                s = float(row.get("start_time") or 0.0)
+                line.append(f"⚠ {secs:.1f}s gap", style="bold yellow")
+                line.append(f"  {fmt_ts(s - secs)} → {fmt_ts(s)}  STILL uncut at "
+                            "this config", style="yellow" if focus else "dim")
+            else:
+                s, e = row.get("start_time"), row.get("end_time")
+                span = (f"{fmt_ts(float(s))}–{fmt_ts(float(e))}"
+                        if s is not None and e is not None else "?–?")
+                rec = bool(row.get("recovered"))
+                line.append(f"{int(row.get('index') or ri):>4} ",
+                            style="bold" if focus else "dim")
+                line.append(f" {span}  ", style="green" if rec else "dim")
+                if rec:
+                    line.append("+ ", style="bold green")
+                if row.get("split"):
+                    line.append("✂ ", style="bold magenta")
+                text = str(row.get("text") or "").replace("\n", " ")
+                empty = ("(no words assigned — audition with r)"
+                         if row.get("realigned") else
+                         "(no committed text — audition with r)")
+                line.append(text if text else empty, style="" if text else "green")
+            line.truncate(width, overflow="ellipsis")
+            out.append_text(line)
+            out.append("\n")
+        if below:
+            out.append(f"   … {below} below\n", style="dim")
+        kind, ri, secs = entries[self.probe_view_cursor]
+        row = self.probe_view_rows[ri]
+        out.append("\n")
+        if kind == "gap":
+            s = float(row.get("start_time") or 0.0)
+            out.append(f"   still uncovered at this config: {fmt_ts(s - secs)} → "
+                       f"{fmt_ts(s)} ({secs:.1f}s)\n", style="yellow")
+        else:
+            s, e = row.get("start_time"), row.get("end_time")
+            if s is not None and e is not None:
+                out.append(f"   {fmt_ts(float(s))} → {fmt_ts(float(e))} · "
+                           f"{float(e) - float(s):.1f}s"
+                           + ("  · recovered span" if row.get("recovered") else "")
+                           + "\n", style="green" if row.get("recovered") else "dim cyan")
+            text = str(row.get("text") or "").replace("\n", " ")
+            w = max(10, width - 4)
+            for j in range(0, min(len(text), 3 * w), w):
+                out.append(f"   {text[j:j + w]}\n")
+        return out
+
     # ---- selection state helpers (pure reads over the indexes) ----
 
     def _run_by_path(self, key: str) -> Optional[Dict[str, Any]]:
@@ -359,6 +681,326 @@ class DecompApp(App):
         # rather than hand off paths the core would refuse.
         self.picked = [p for p in self.picked if self._run_by_path(p) is not None]
 
+    async def _open_segments(self) -> None:
+        """Drill the focused results source into its committed fine spine.
+
+        Opens the lazy READ-ONLY graph seat against the db this decomp run
+        RECORDED (e087d059 reused; explicit --graph-db-path still wins), reads
+        the manifest's segment_ids back in spine order, and interleaves the
+        gap rows (de994164: a chunk VAD never cut is invisible downstream —
+        the uncovered span between committed rows is where it shows)."""
+        m = self.dec_index.runs[self.results_run]
+        srcs = m.get("sources") or []
+        if not srcs:
+            return
+        src = srcs[self.results_src]
+        ids = [str(i) for i in (src.get("segment_ids") or [])]
+        if not ids:
+            self.error = (f"{m['run_id']}: no segment_ids recorded for this "
+                          "source (pre-segment_ids manifest?)")
+            self._paint()
+            return
+        db = self.graph_db_path or SourceRunIndex.recorded_graph_db(m, self.graph_capability)
+        if not db or not Path(db).exists():
+            self.error = ("no graph db recorded for this decomp run — pass --graph-db-path"
+                          if not db else f"recorded graph db missing on disk: {tail(db, 40)}")
+            self._paint()
+            return
+        self.notice = f"opening graph (read-only) · {tail(db, 32)} …"
+        self._paint_now()
+        try:
+            if self._seg_stack is None:
+                self._seg_stack = SegmentStack(self.manifests_dir, self.graph_capability)
+            await self._seg_stack.open(db)
+            rows = await self._seg_stack.read_segments(ids)
+            rends = sorted({str(r.get("rendition_id"))
+                            for r in rows if r.get("rendition_id")})
+            src_node = str(src.get("source_node_id") or "")
+            asegs = (await self._seg_stack.read_audio_join(src_node, rends)
+                     if src_node and rends else [])
+        except (Exception, SystemExit) as e:
+            # SystemExit included: load_capabilities exits on a missing
+            # manifest, and an async action must never take the app with it.
+            self.notice = None
+            self.error = f"graph open failed: {e}"
+            self._paint()
+            return
+        self.seg_rows = rows
+        self.seg_missing = len(ids) - len(rows)
+        self.seg_title = str(src.get("title") or "?")
+        self.seg_vad = vad_summary(m)
+        self.seg_source_id = src_node
+        self.seg_asegs = asegs
+        self.seg_vad_id = str((m.get("config") or {}).get("vad_capability")
+                              or "cjm-capability-silero-vad")
+        vcap = (m.get("capabilities") or {}).get(self.seg_vad_id) or {}
+        self.seg_vad_cfg = dict(vcap.get("config") or {})
+        self.seg_fa_id = str((m.get("config") or {}).get("fa_capability")
+                             or "cjm-capability-qwen3-forced-aligner")
+        fcap = (m.get("capabilities") or {}).get(self.seg_fa_id) or {}
+        self.seg_fa_cfg = dict(fcap.get("config") or {})
+        self.seg_text_from = str((m.get("config") or {}).get("text_from") or "")
+        self.seg_display = build_display(rows, self.gap_threshold)
+        self.seg_cursor = 0
+        self.stage = "segments"
+        self.notice = None
+        self.error = None
+        self._paint()
+
+    async def _close_segments(self) -> None:
+        """Tear down the read-only graph seat (quit/confirm paths)."""
+        if self._seg_stack is not None:
+            try:
+                await self._seg_stack.close()
+            except Exception:
+                pass
+            self._seg_stack = None
+
+    def _play_focused(self) -> None:
+        """Play the focused entry's audio span (r) — gaps INCLUDED.
+
+        A gap's audio exists in NO fine chunk (it was never cut), but the
+        coarse model-input WAV spans it, so the audition reads from the owning
+        AudioSegment's WAV via locate_span (the 6beaa0e4 demand, served here
+        where the gap rows live)."""
+        if self.stage == "segments" and self.seg_display:
+            entries, rows, cur = self.seg_display, self.seg_rows, self.seg_cursor
+        elif self.stage == "probeview" and self.probe_view_display:
+            entries, rows, cur = (self.probe_view_display, self.probe_view_rows,
+                                  self.probe_view_cursor)
+        else:
+            return
+        kind, ri, secs = entries[cur]
+        r = rows[ri]
+        if kind == "gap":
+            s = float(r.get("start_time") or 0.0)
+            span = (s - secs, s)
+        else:
+            if r.get("start_time") is None or r.get("end_time") is None:
+                return
+            span = (float(r["start_time"]), float(r["end_time"]))
+        loc = locate_span(self.seg_asegs, span[0], span[1])
+        if loc is None:
+            self.error = "no model-input WAV covers this span"
+            self._paint()
+            return
+        wav, ls, le = loc
+        try:
+            if self.player is None:
+                self.player = ChunkPlayer()
+            self.player.play(load_chunk(wav, ls, le, speed=self.speed))
+            self.notice = f"▶ {fmt_ts(span[0])} → {fmt_ts(span[1])} ×{self.speed:g}"
+            self.error = None
+        except Exception as e:
+            self.error = f"audio: {e}"
+        self._paint()
+
+    def action_stop_audio(self) -> None:
+        """Escape: close the transient editor, else stop playback."""
+        if self.form_editing:
+            self._close_field_editor()
+            self._paint()
+            return
+        if self.player is not None:
+            self.player.stop()
+            self.notice = None
+            self._paint()
+
+    def action_speed_down(self) -> None:
+        self._nudge_speed(-0.25)
+
+    def action_speed_up(self) -> None:
+        self._nudge_speed(0.25)
+
+    def _nudge_speed(self, delta: float) -> None:
+        """[ / ] playback-speed ladder 0.5-3.0 (kit WSOLA — pitch survives)."""
+        if self.stage not in ("segments", "probeview"):
+            return
+        self.speed = max(0.5, min(3.0, self.speed + delta))
+        self.notice = f"speed ×{self.speed:g}"
+        self._paint()
+
+    def action_vad_config(self) -> None:
+        """Open the VAD probe form (c in segments; 166dd2b8 half b).
+
+        Form rows come from the manifest config_schema, seeded with the RUN's
+        recorded config; the probe target freezes to the coarse chunk holding
+        the focused entry (gap start for gap rows)."""
+        if self.stage != "segments":
+            return
+        schema = capability_config_schema(self.manifests_dir, self.seg_vad_id)
+        form = ConfigForm.from_schema(schema)
+        if not form.fields:
+            self.error = f"{self.seg_vad_id}: no config_schema in {self.manifests_dir}"
+            self._paint()
+            return
+        form.apply(self.seg_vad_cfg)
+        self.vad_form = form
+        self.form_cursor = 0
+        self.probe_result = None
+        self._probe_ctx = None
+        self.probe_view_rows = []
+        self.probe_view_display = []
+        self.probe_view_cursor = 0
+        t = None
+        if self.seg_display:
+            kind, ri, secs = self.seg_display[self.seg_cursor]
+            r = self.seg_rows[ri]
+            if r.get("start_time") is not None:
+                t = float(r["start_time"]) - (secs if kind == "gap" else 0.0)
+        self.probe_aseg = aseg_index_for(self.seg_asegs, t) if t is not None else None
+        self.error = None
+        self.stage = "vadform"
+        self._paint()
+
+    async def action_probe(self) -> None:
+        """Run the form's config over the target coarse WAV (p; probe-only)."""
+        if (self.stage != "vadform" or self.vad_form is None or self.probe_busy
+                or self._seg_stack is None):
+            return
+        if self.probe_aseg is None or not self.seg_asegs:
+            self.error = "no probe target — reopen the form from a timed entry"
+            self._paint()
+            return
+        a = self.seg_asegs[self.probe_aseg]
+        if not a.get("wav"):
+            self.error = "target coarse chunk has no model-input WAV on disk"
+            self._paint()
+            return
+        cfg = {f.key: f.value for f in self.vad_form.fields}
+        self.probe_busy = True
+        self.error = None
+        self._paint_now()
+        try:
+            local = await self._seg_stack.probe_vad(self.seg_vad_id, cfg, a["wav"])
+        except (Exception, SystemExit) as e:
+            self.probe_busy = False
+            self.error = f"probe failed: {e}"
+            self._paint()
+            return
+        # FA leg: realign the coarse Transcript's text over the predicted
+        # skeleton — the pipeline's own fold, so the walk shows the text a
+        # re-decomposition would COMMIT (drive feedback: borrowed text
+        # repeated a split chunk's whole parent). Failure degrades to borrow.
+        fa_text: Optional[str] = None
+        fa_words: Optional[List[Tuple[str, float, float]]] = None
+        rend = a.get("rendition")
+        if rend and self.seg_text_from:
+            try:
+                text = await self._seg_stack.read_transcript_text(
+                    rend, self.seg_text_from)
+                if text:
+                    self.notice = f"aligning (FA · {len(local)} chunk(s)) …"
+                    self._paint_now()
+                    fa_words = await self._seg_stack.probe_fa(
+                        self.seg_fa_id, self.seg_fa_cfg, a["wav"], text)
+                    fa_text = text
+            except (Exception, SystemExit) as e:
+                self.notice = f"FA realign unavailable ({e}) — text borrowed"
+        self.probe_busy = False
+        self._probe_ctx = (a, local, fa_text, fa_words)
+        self._rebuild_probe_view()
+        self._paint()
+
+    def _rebuild_probe_view(self) -> None:
+        """Derive the probe readout + walkable predicted rows from the last probe.
+
+        Re-derivable when the s split-preview toggles — no re-probe needed: the
+        VAD + FA outputs are unchanged, only the skeleton refinement differs
+        (split_predicted runs the pipeline's OWN stage, then the fold re-runs
+        over the refined chunks — DEC f1024568 deliverable d)."""
+        if self._probe_ctx is None:
+            return
+        a, local, fa_text, fa_words = self._probe_ctx
+        chunks_local = list(local)
+        realigned = None
+        n_cuts = 0
+        if fa_text and fa_words is not None:
+            if self.probe_split:
+                chunks_local = split_predicted(fa_text, fa_words, local)
+                n_cuts = len(chunks_local) - len(local)
+            realigned = realign_rows(fa_text, fa_words, chunks_local)
+        predicted = [(s + a["start"], e + a["start"]) for s, e in chunks_local]
+        committed = [(float(r["start_time"]), float(r["end_time"]))
+                     for r in self.seg_rows
+                     if r.get("start_time") is not None
+                     and r.get("end_time") is not None
+                     and a["start"] <= float(r["start_time"]) < a["end"]]
+        gaps = []
+        for kind, ri, secs in self.seg_display:
+            if kind != "gap":
+                continue
+            gs = float(self.seg_rows[ri].get("start_time") or 0.0) - secs
+            if a["start"] <= gs < a["end"]:
+                gaps.append((gs, gs + secs))
+        self.probe_result = probe_compare(committed, predicted, gaps)
+        self.probe_view_rows = predicted_rows(predicted, self.seg_rows, gaps,
+                                              realigned=realigned)
+        if n_cuts > 0:
+            # Mark the rows the split stage minted (spans absent from the raw
+            # VAD prediction) — the ✂ is the judgment target.
+            originals = {(round(s, 3), round(e, 3)) for s, e in local}
+            for row, (ls, le) in zip(self.probe_view_rows, chunks_local):
+                row["split"] = (round(ls, 3), round(le, 3)) not in originals
+        self.probe_view_display = build_display(self.probe_view_rows,
+                                                self.gap_threshold)
+        self.probe_view_cursor = 0
+        if fa_words is not None:
+            split_tag = f" · sentence-split ×{n_cuts}" if self.probe_split else ""
+            self.notice = f"v walks the predicted skeleton (FA-realigned{split_tag})"
+        elif self.probe_split:
+            self.notice = "split preview needs FA — realign unavailable, raw skeleton shown"
+        elif not (self.notice or "").startswith("FA realign unavailable"):
+            self.notice = "v walks the predicted skeleton (text borrowed)"
+
+    def action_toggle_split(self) -> None:
+        """s: toggle sentence-split — the BATCH flag in RUNS (rides the plan
+        into the core hand-off as --sentence-split), the probe PREVIEW in the
+        form/probe views (re-derives in place; pure post-FA refinement)."""
+        if self.stage == "runs":
+            self.sentence_split = not self.sentence_split
+            self.notice = ("batch sentence-split ON — confirmed groups run "
+                           "--sentence-split (parallel spine, new skeleton hash)"
+                           if self.sentence_split else "batch sentence-split off")
+            self._paint()
+            return
+        if self.stage not in ("vadform", "probeview"):
+            return
+        self.probe_split = not self.probe_split
+        if self._probe_ctx is not None:
+            self._rebuild_probe_view()
+        else:
+            self.notice = f"sentence-split preview {'ON' if self.probe_split else 'off'}"
+        self._paint()
+
+    def _open_field_editor(self, field) -> None:
+        """Show the transient Input primed with a field's current value."""
+        editor = self.query_one("#editor", Input)
+        editor.value = field.render()
+        editor.display = True
+        editor.focus()
+        self.form_editing = True
+
+    def _close_field_editor(self) -> None:
+        editor = self.query_one("#editor", Input)
+        editor.display = False
+        editor.value = ""
+        self.set_focus(None)
+        self.form_editing = False
+
+    async def on_input_submitted(self, event) -> None:
+        """Apply a typed value to the focused form field (enter in the Input)."""
+        if not self.form_editing or self.vad_form is None:
+            return
+        field = self.vad_form.fields[self.form_cursor]
+        try:
+            field.parse(event.value)
+            self.error = None
+        except ValueError as e:
+            self.error = f"{field.key}: {e}"
+        self._close_field_editor()
+        self._paint()
+
     # ---- stage actions (single key vocabulary, stage-dispatched) ----
 
     def action_move(self, delta: int) -> None:
@@ -366,6 +1008,18 @@ class DecompApp(App):
             if self.src_index.runs:
                 self.cursor = max(0, min(self.cursor + delta,
                                          len(self.src_index.runs) - 1))
+        elif self.stage == "segments":
+            if self.seg_display:
+                self.seg_cursor = max(0, min(self.seg_cursor + delta,
+                                             len(self.seg_display) - 1))
+        elif self.stage == "vadform":
+            if self.vad_form is not None and self.vad_form.fields:
+                self.form_cursor = max(0, min(self.form_cursor + delta,
+                                              len(self.vad_form.fields) - 1))
+        elif self.stage == "probeview":
+            if self.probe_view_display:
+                self.probe_view_cursor = max(0, min(self.probe_view_cursor + delta,
+                                                    len(self.probe_view_display) - 1))
         elif self.results_run is None:
             if self.dec_index.runs:
                 self.results_cursor = max(0, min(self.results_cursor + delta,
@@ -384,7 +1038,7 @@ class DecompApp(App):
     def on_mouse_scroll_up(self, event) -> None:
         self.action_move(-1)
 
-    def action_select(self) -> None:
+    async def action_select(self) -> None:
         if self.stage == "runs":
             runs = self.src_index.runs
             if not runs:
@@ -402,9 +1056,20 @@ class DecompApp(App):
             else:
                 self.picked.append(key)
             self.error = None
-        elif self.results_run is None and self.dec_index.runs:
+        elif self.stage == "results" and self.results_run is None and self.dec_index.runs:
             self.results_run = self.results_cursor
             self.results_src = 0
+        elif self.stage == "results" and self.results_run is not None:
+            await self._open_segments()
+            return
+        elif self.stage == "vadform":
+            # Closed sets (enum/bool) cycle in place; open kinds hand off to
+            # the transient Input (the value-typing escape hatch).
+            if (self.vad_form is not None and self.vad_form.fields
+                    and not self.form_editing):
+                field = self.vad_form.fields[self.form_cursor]
+                if not field.cycle():
+                    self._open_field_editor(field)
         self._paint()
 
     def action_cycle_text_from(self) -> None:
@@ -430,7 +1095,17 @@ class DecompApp(App):
 
     def action_results(self) -> None:
         """Open the decomp-runs view (v): re-reads the manifests so a batch
-        that just finished in another terminal shows without a restart."""
+        that just finished in another terminal shows without a restart.
+        In the VAD form, v walks the last probe's predicted skeleton."""
+        if self.stage == "vadform":
+            if self.probe_view_display:
+                self.stage = "probeview"
+                self.notice = None
+                self._paint()
+            else:
+                self.error = "no probe yet — p runs the form's config first"
+                self._paint()
+            return
         if self.stage != "runs":
             return
         self.notice = None
@@ -442,6 +1117,9 @@ class DecompApp(App):
         self._paint()
 
     def action_reload(self) -> None:
+        if self.stage in ("segments", "probeview"):
+            self._play_focused()   # r = play focused (the correction-TUI replay key)
+            return
         if self.stage != "runs":
             return
         self._reload_indexes()
@@ -450,14 +1128,22 @@ class DecompApp(App):
         self._paint()
 
     def action_back(self) -> None:
-        if self.stage == "results":
+        if self.stage == "probeview":
+            self.stage = "vadform"
+        elif self.stage == "vadform":
+            if self.form_editing:
+                self._close_field_editor()
+            self.stage = "segments"
+        elif self.stage == "segments":
+            self.stage = "results"  # seat stays open — b is a browse, not a teardown
+        elif self.stage == "results":
             if self.results_run is not None:
                 self.results_run = None  # drilled run -> back to the decomp list
             else:
                 self.stage = "runs"
         self._paint()
 
-    def action_confirm(self) -> None:
+    async def action_confirm(self) -> None:
         if self.stage != "runs":
             return
         if not self.picked:
@@ -472,6 +1158,9 @@ class DecompApp(App):
                               "— pass --graph-db-path to override")
                 self._paint()
                 return
+        if self.player is not None:
+            self.player.close()
+        await self._close_segments()
         self.exit({
             "batches": [{"text_from": tf, "graph_db_path": db,
                          "manifests": list(paths)}
@@ -481,7 +1170,11 @@ class DecompApp(App):
             "sysmon_capability": self.sysmon_capability,
             "graph_capability": self.graph_capability,
             "graph_db_path": self.graph_db_path,
+            "sentence_split": self.sentence_split,
         })
 
-    def action_quit_app(self) -> None:
+    async def action_quit_app(self) -> None:
+        if self.player is not None:
+            self.player.close()
+        await self._close_segments()
         self.exit(None)

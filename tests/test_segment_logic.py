@@ -132,16 +132,21 @@ def test_predicted_rows_realigned_text_wins():
 
 
 def test_split_predicted_refines_probe_skeleton():
-    # The probe-side sentence-split preview runs the pipeline's own stage: a
-    # predicted chunk holding two sentences splits at the FA word gap, and the
-    # realign fold over the refined spans yields <=1 sentence per chunk.
+    # The probe-side sentence-split preview runs the pipeline's own stage with
+    # CAPABILITY-delivered sentence spans (B.5): a predicted chunk holding two
+    # sentences splits at the FA word gap, and the realign fold over the
+    # refined spans yields <=1 sentence per chunk.
     text = "Hello world. Foo bar."
     words = [("hello", 0.0, 0.5), ("world", 0.5, 1.0),
              ("foo", 1.4, 2.5), ("bar", 2.5, 3.0)]
+    sent_spans = [(0, 12), (13, 21)]  # "Hello world." / "Foo bar."
     predicted = [(0.0, 3.1)]
-    refined = split_predicted(text, words, predicted)
+    refined = split_predicted(text, words, predicted, sent_spans)
     assert refined == [(0.0, 1.2), (1.2, 3.1)]
     assert realign_rows(text, words, refined) == ["Hello world.", "Foo bar."]
     # No sentence crossing -> the skeleton passes through unchanged.
-    assert split_predicted(text, words, [(0.0, 1.2), (1.9, 3.1)]) \
+    assert split_predicted(text, words, [(0.0, 1.2), (1.9, 3.1)], sent_spans) \
         == [(0.0, 1.2), (1.9, 3.1)]
+    # One span covering everything (the abbreviation class, now the
+    # segmenter's job) -> nothing cuts.
+    assert split_predicted(text, words, predicted, [(0, len(text))]) == predicted

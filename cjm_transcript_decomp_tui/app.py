@@ -120,6 +120,8 @@ class DecompApp(App):
         self.seg_vad_cfg: Dict[str, Any] = {}
         self.seg_fa_id = "cjm-capability-qwen3-forced-aligner"
         self.seg_fa_cfg: Dict[str, Any] = {}
+        self.seg_seg_id = "cjm-capability-pysbd"
+        self.seg_seg_cfg: Dict[str, Any] = {}
         self.seg_text_from = ""
         self.seg_asegs: List[Dict[str, Any]] = []
         # Audio + probe (drive feedback 2026-07-22): r auditions the focused
@@ -144,7 +146,8 @@ class DecompApp(App):
         self.sentence_split = sentence_split
         self._probe_ctx: Optional[Tuple[Dict[str, Any], List[Tuple[float, float]],
                                         Optional[str],
-                                        Optional[List[Tuple[str, float, float]]]]] = None
+                                        Optional[List[Tuple[str, float, float]]],
+                                        Optional[List[Tuple[int, int]]]]] = None
         # Probe-skeleton view (drive feedback: counts alone cannot answer
         # "worth a re-decomposition?" — the predicted skeleton must WALK).
         self.probe_view_rows: List[Dict[str, Any]] = []
@@ -739,6 +742,12 @@ class DecompApp(App):
                              or "cjm-capability-qwen3-forced-aligner")
         fcap = (m.get("capabilities") or {}).get(self.seg_fa_id) or {}
         self.seg_fa_cfg = dict(fcap.get("config") or {})
+        # B.5 probe parity: the split preview segments with the RUN's segmenter
+        # when the manifest recorded one, else the pipeline default.
+        self.seg_seg_id = str((m.get("config") or {}).get("seg_capability")
+                              or "cjm-capability-pysbd")
+        scap = (m.get("capabilities") or {}).get(self.seg_seg_id) or {}
+        self.seg_seg_cfg = dict(scap.get("config") or {})
         self.seg_text_from = str((m.get("config") or {}).get("text_from") or "")
         self.seg_display = build_display(rows, self.gap_threshold)
         self.seg_cursor = 0
@@ -884,6 +893,7 @@ class DecompApp(App):
         # repeated a split chunk's whole parent). Failure degrades to borrow.
         fa_text: Optional[str] = None
         fa_words: Optional[List[Tuple[str, float, float]]] = None
+        seg_spans: Optional[List[Tuple[int, int]]] = None
         rend = a.get("rendition")
         if rend and self.seg_text_from:
             try:
@@ -897,8 +907,17 @@ class DecompApp(App):
                     fa_text = text
             except (Exception, SystemExit) as e:
                 self.notice = f"FA realign unavailable ({e}) — text borrowed"
+        if fa_text:
+            # B.5 probe parity: sentence spans from the segmentation CAPABILITY
+            # (same segmenter a --sentence-split re-decomposition would run).
+            # Failure degrades to no split preview, never a wedged probe.
+            try:
+                seg_spans = await self._seg_stack.probe_segment(
+                    self.seg_seg_id, self.seg_seg_cfg, fa_text)
+            except (Exception, SystemExit) as e:
+                self.notice = f"sentence-segmentation unavailable ({e}) — split preview off"
         self.probe_busy = False
-        self._probe_ctx = (a, local, fa_text, fa_words)
+        self._probe_ctx = (a, local, fa_text, fa_words, seg_spans)
         self._rebuild_probe_view()
         self._paint()
 
@@ -911,13 +930,13 @@ class DecompApp(App):
         over the refined chunks — DEC f1024568 deliverable d)."""
         if self._probe_ctx is None:
             return
-        a, local, fa_text, fa_words = self._probe_ctx
+        a, local, fa_text, fa_words, seg_spans = self._probe_ctx
         chunks_local = list(local)
         realigned = None
         n_cuts = 0
         if fa_text and fa_words is not None:
-            if self.probe_split:
-                chunks_local = split_predicted(fa_text, fa_words, local)
+            if self.probe_split and seg_spans is not None:
+                chunks_local = split_predicted(fa_text, fa_words, local, seg_spans)
                 n_cuts = len(chunks_local) - len(local)
             realigned = realign_rows(fa_text, fa_words, chunks_local)
         predicted = [(s + a["start"], e + a["start"]) for s, e in chunks_local]

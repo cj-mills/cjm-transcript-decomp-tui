@@ -18,7 +18,7 @@ from cjm_substrate.core.manager import CapabilityManager
 from cjm_substrate.core.queue import JobQueue
 from cjm_transcript_decomp_core.alignment import (assign_words_to_chunks,
                                                   build_segments_from_alignment,
-                                                  map_fa_words_to_text,
+                                                  map_fa_words_to_text, sentence_end_word_indices,
                                                   split_chunks_at_sentence_gaps)
 from cjm_transcript_decomp_core.cli import load_capabilities
 from cjm_transcript_decomp_core.models import FAWord, VADChunk
@@ -165,6 +165,22 @@ class SegmentStack:
                                        control={"force": False})
         return [(str(it.text), float(it.start_time), float(it.end_time))
                 for it in result.items]
+
+    async def probe_segment(self, seg_capability: str, config: Dict[str, Any],
+                            text: str) -> List[Tuple[int, int]]:
+        """Sentence-segment a transcript text (PROBE-ONLY; B.5 probe parity).
+
+        Loads the segmentation capability exactly like VAD/FA (_ensure_probe),
+        so the s split-preview shows CAPABILITY-segmented cuts pre-commit —
+        the same spans a --sentence-split re-decomposition would use. Cheap
+        rule-based CPU (no adapter cache to warm)."""
+        if self._manager is None or self._queue is None:
+            raise RuntimeError("segment seat not open — call open(db_path) first")
+        self._ensure_probe(seg_capability, config)
+        result = await submit_and_wait(self._queue, seg_capability, text=text,
+                                       task="sentence_segmentation",
+                                       method="segment_text")
+        return [(int(s.start_char), int(s.end_char)) for s in result.spans]
 
     async def read_transcript_text(self, rendition_id: str,
                                    transcriber: str) -> Optional[str]:
@@ -416,18 +432,21 @@ def split_predicted(
     coarse_text: str,                          # The authoritative transcriber's full coarse text
     fa_words: List[Tuple[str, float, float]],  # (word, start_s, end_s) — WAV-local FA output (probe_fa)
     predicted_local: List[Tuple[float, float]],  # Predicted chunk spans, WAV-local
+    sentence_spans: List[Tuple[int, int]],     # Capability sentence spans over coarse_text (probe_segment)
     min_chunk_s: float = 0.5,                  # Split min sub-chunk duration guard (the pipeline default)
 ) -> List[Tuple[float, float]]:  # The sentence-split refined spans (WAV-local)
     """Run the decomp pipeline's own SENTENCE-SPLIT stage over a probe skeleton
     (pure; DEC f1024568 deliverable d — preview before any commit).
 
-    Reuses the core stage verbatim (same policy, same guard), so the probe view
-    shows exactly the skeleton a `--sentence-split` re-decomposition would
-    commit. Feed the result to realign_rows for the per-chunk text."""
+    Reuses the core stage verbatim (same policy, same guard) with the
+    CAPABILITY-delivered sentence spans (B.5), so the probe view shows exactly
+    the skeleton a `--sentence-split` re-decomposition would commit. Feed the
+    result to realign_rows for the per-chunk text."""
     words = [FAWord(text=w, start_time=s, end_time=e) for w, s, e in fa_words]
     chunks = [VADChunk(index=i, start_time=s, end_time=e)
               for i, (s, e) in enumerate(predicted_local)]
     spans = map_fa_words_to_text(coarse_text, words)
-    refined = split_chunks_at_sentence_gaps(chunks, words, spans, coarse_text,
+    end_words = sentence_end_word_indices(spans, sentence_spans)
+    refined = split_chunks_at_sentence_gaps(chunks, words, end_words,
                                             min_chunk_s=min_chunk_s)
     return [(c.start_time, c.end_time) for c in refined]

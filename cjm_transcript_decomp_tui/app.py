@@ -86,7 +86,7 @@ class DecompApp(App):
                  graph_capability: str = "cjm-capability-graph-sqlite",  # Extension target
                  graph_db_path: Optional[str] = None,      # Caller-wins graph db override
                  gap_threshold: float = 2.0,               # Seconds of uncovered span that paints a gap row
-                 sentence_split: bool = False):            # Seed the batch-level split toggle (--sentence-split)
+                 sentence_split: bool = True):             # Seed the batch-level split toggle (DEFAULT-ON, DEC 552bde8d; s toggles)
         super().__init__()
         self.manifests_dir = manifests_dir
         self.sysmon_capability = sysmon_capability

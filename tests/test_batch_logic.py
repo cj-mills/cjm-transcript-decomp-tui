@@ -125,13 +125,17 @@ def test_provenance_reads():
 
 
 def test_batch_argv_sentence_split_passthrough():
-    # The batch-level split toggle (s in RUNS, or --sentence-split) renders into
-    # the hand-off argv with its guard; off = absent (copy-pasteable minimal).
-    args = build_parser().parse_args(["--sentence-split", "--split-min-chunk-s", "0.7"])
+    # Sentence-split is DEFAULT-ON (DEC 552bde8d): a bare parse renders the
+    # explicit ON pair, and an OFF toggle must ride the argv as
+    # --no-sentence-split — the core default would silently re-enable it.
+    args = build_parser().parse_args(["--split-min-chunk-s", "0.7"])
+    assert args.sentence_split is True
     argv = batch_argv({"text_from": None, "graph_db_path": None,
                        "manifests": ["a.json"]}, args, None)
     assert "--sentence-split" in argv
     assert argv[argv.index("--split-min-chunk-s") + 1] == "0.7"
+    off_args = build_parser().parse_args(["--no-sentence-split"])
     off = batch_argv({"text_from": None, "graph_db_path": None,
-                      "manifests": ["a.json"]}, build_parser().parse_args([]), None)
+                      "manifests": ["a.json"]}, off_args, None)
+    assert "--no-sentence-split" in off
     assert "--sentence-split" not in off and "--split-min-chunk-s" not in off

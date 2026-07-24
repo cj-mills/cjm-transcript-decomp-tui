@@ -53,9 +53,10 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
                    help="Explicitly disable the monitor (overrides state + discovery)")
     p.add_argument("--language", default="English",
                    help="Forced-alignment language (forwarded to the core)")
-    p.add_argument("--sentence-split", action="store_true",
+    p.add_argument("--sentence-split", action=argparse.BooleanOptionalAction, default=True,
                    help="Run every confirmed group with the post-FA sentence-split "
                         "stage (forwarded to the core; commits a PARALLEL spine). "
+                        "DEFAULT-ON (DEC 552bde8d); --no-sentence-split opts out. "
                         "Also toggleable in-TUI with s on the runs stage")
     p.add_argument("--split-min-chunk-s", type=float, default=0.5,
                    help="Sentence-split min sub-chunk duration guard, seconds "
@@ -107,6 +108,10 @@ def batch_argv(
         argv += ["--force"]
     if args.sentence_split:
         argv += ["--sentence-split", "--split-min-chunk-s", str(args.split_min_chunk_s)]
+    else:
+        # The core is default-on (DEC 552bde8d): an OFF toggle must ride the
+        # argv explicitly or the hand-off silently re-enables the split.
+        argv += ["--no-sentence-split"]
     if args.actor:
         argv += ["--actor", args.actor]
     return argv

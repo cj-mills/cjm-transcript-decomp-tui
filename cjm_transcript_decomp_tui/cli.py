@@ -61,6 +61,11 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
     p.add_argument("--split-min-chunk-s", type=float, default=0.5,
                    help="Sentence-split min sub-chunk duration guard, seconds "
                         "(forwarded to the core; identity input)")
+    p.add_argument("--respine", action="store_true",
+                   help="Run every confirmed group with --respine (DEC 9241564f): a FRESH "
+                        "skeleton spine under the SAME config — the recovery for the "
+                        "post-upgrade verify-collide (finding e8458f6e). Also toggleable "
+                        "in-TUI with R on the runs stage")
     p.add_argument("--force", action="store_true",
                    help="Bypass capability-side caches (forwarded to the core)")
     p.add_argument("--actor", default=None,
@@ -112,6 +117,10 @@ def batch_argv(
         # The core is default-on (DEC 552bde8d): an OFF toggle must ride the
         # argv explicitly or the hand-off silently re-enables the split.
         argv += ["--no-sentence-split"]
+    if args.respine:
+        # Core default is OFF, so only the ON state needs rendering — but it
+        # MUST render (DEC 9241564f): a fresh spine is a deliberate, visible act.
+        argv += ["--respine"]
     if args.actor:
         argv += ["--actor", args.actor]
     return argv
@@ -141,7 +150,8 @@ def main() -> int:  # Console-script entry point (cjm-transcript-decomp-tui)
                     graph_capability=args.graph_capability,
                     graph_db_path=graph_db_path,
                     gap_threshold=args.gap_threshold,
-                    sentence_split=args.sentence_split)
+                    sentence_split=args.sentence_split,
+                    respine=args.respine)
     plan = app.run()
     if not plan:
         print("no batch confirmed")
@@ -149,8 +159,9 @@ def main() -> int:  # Console-script entry point (cjm-transcript-decomp-tui)
     save_state(args.manifests_dir,
                sysmon_capability=plan["sysmon_capability"],
                graph_db_path=plan["graph_db_path"])
-    # The in-TUI s toggle wins over the launch flag (the hub path has no flags).
+    # The in-TUI s/R toggles win over the launch flags (the hub path has no flags).
     args.sentence_split = bool(plan.get("sentence_split"))
+    args.respine = bool(plan.get("respine"))
     rc = 0
     for i, batch in enumerate(plan["batches"]):
         argv = batch_argv(batch, args, plan["sysmon_capability"])

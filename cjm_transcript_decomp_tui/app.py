@@ -70,6 +70,7 @@ class DecompApp(App):
         Binding("c", "vad_config", "vad config"),
         Binding("p", "probe", "probe"),
         Binding("s", "toggle_split", "split preview", show=False),
+        Binding("R", "toggle_respine", "respine", show=False),
         Binding("left_square_bracket", "speed_down", "slower", show=False,
                 key_display="["),
         Binding("right_square_bracket", "speed_up", "faster", show=False,
@@ -86,8 +87,10 @@ class DecompApp(App):
                  graph_capability: str = "cjm-capability-graph-sqlite",  # Extension target
                  graph_db_path: Optional[str] = None,      # Caller-wins graph db override
                  gap_threshold: float = 2.0,               # Seconds of uncovered span that paints a gap row
-                 sentence_split: bool = True):             # Seed the batch-level split toggle (DEFAULT-ON, DEC 552bde8d; s toggles)
+                 sentence_split: bool = True,              # Seed the batch-level split toggle (DEFAULT-ON, DEC 552bde8d; s toggles)
+                 respine: bool = False):                   # Seed the batch-level respine toggle (fresh spine, same config — DEC 9241564f; R toggles)
         super().__init__()
+        self.respine = respine
         self.manifests_dir = manifests_dir
         self.sysmon_capability = sysmon_capability
         self.graph_capability = graph_capability
@@ -200,7 +203,7 @@ class DecompApp(App):
             status.append(f" {self.notice} ", style="cyan")
         else:
             hints = {
-                "runs": "enter/space pick · t text-from · s split · v decomp runs · r reload · n confirm · q quit",
+                "runs": "enter/space pick · t text-from · s split · R respine · v decomp runs · r reload · n confirm · q quit",
                 "results": ("enter open run · j/k walk · b back · q quit"
                             if self.results_run is None
                             else "enter segments · j/k source · b decomp list · q quit"),
@@ -300,6 +303,8 @@ class DecompApp(App):
                        f"invocation(s))", style="bold")
             if self.sentence_split:
                 out.append("  ✂ sentence-split ON", style="bold magenta")
+            if self.respine:
+                out.append("  ⟳ respine ON (fresh spine, same config)", style="bold cyan")
             out.append(":\n", style="bold")
             for bi, ((tf, db), paths) in enumerate(batches):
                 short = (tf or "?").removeprefix("cjm-capability-")
@@ -972,6 +977,24 @@ class DecompApp(App):
         elif not (self.notice or "").startswith("FA realign unavailable"):
             self.notice = "v walks the predicted skeleton (text borrowed)"
 
+    def action_toggle_respine(self) -> None:
+        """R: toggle respine — fresh spine under the SAME config (DEC 9241564f).
+
+        The recovery for the e8458f6e verify-collide: a post-upgrade re-run of
+        an already-decomposed source refuses (drifted text-slice provenance
+        cannot re-emit the same skeleton ids, correctly) — respine mints a
+        DISTINCT skeleton hash so the re-run coexists instead of colliding.
+        Rides the plan into the hand-off argv as --respine (the split-toggle
+        precedent: what the TUI decided is always visible in the printed
+        command)."""
+        if self.stage != "runs":
+            return
+        self.respine = not self.respine
+        self.notice = ("batch respine ON — confirmed groups run --respine "
+                       "(fresh spine, same config; coexists with the old one)"
+                       if self.respine else "batch respine off")
+        self._paint()
+
     def action_toggle_split(self) -> None:
         """s: toggle sentence-split — the BATCH flag in RUNS (rides the plan
         into the core hand-off as --sentence-split), the probe PREVIEW in the
@@ -1190,6 +1213,7 @@ class DecompApp(App):
             "graph_capability": self.graph_capability,
             "graph_db_path": self.graph_db_path,
             "sentence_split": self.sentence_split,
+            "respine": self.respine,
         })
 
     async def action_quit_app(self) -> None:

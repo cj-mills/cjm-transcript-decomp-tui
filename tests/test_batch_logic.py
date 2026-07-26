@@ -139,3 +139,17 @@ def test_batch_argv_sentence_split_passthrough():
                       "manifests": ["a.json"]}, off_args, None)
     assert "--no-sentence-split" in off
     assert "--sentence-split" not in off and "--split-min-chunk-s" not in off
+
+
+def test_batch_argv_renders_respine():
+    """DEC 9241564f: the R toggle rides the hand-off argv as --respine — a
+    fresh spine is a deliberate, VISIBLE act; off = absent (core default off)."""
+    args = build_parser().parse_args(["--manifests-dir", "m", "--runs-dir", "r",
+                                      "--respine"])
+    argv = batch_argv({"text_from": None, "graph_db_path": None,
+                       "manifests": ["a.json"]}, args, None)
+    assert "--respine" in argv
+    args_off = build_parser().parse_args(["--manifests-dir", "m", "--runs-dir", "r"])
+    assert not args_off.respine
+    assert "--respine" not in batch_argv({"text_from": None, "graph_db_path": None,
+                                          "manifests": ["a.json"]}, args_off, None)

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cjm-transcript-decomp-tui"
-version = "0.0.1"
+version = "0.0.2"
 description = "Decomp-batch TUI driver: browse transcription-core run manifests, queue an ordered multi-run batch with per-run authoritative-text picks, then hand off to cjm-transcript-decomp-core's headless batch runner (one capability stack for the whole batch). Born on-graph."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -16,7 +16,7 @@ classifiers = [
 ]
 dependencies = [
     'cjm-substrate-tui-kit>=0.0.1',
-    'cjm-transcript-decomp-core>=0.0.4',
+    'cjm-transcript-decomp-core>=0.0.5',
     'textual',
 ]
 

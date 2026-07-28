@@ -1,6 +1,6 @@
 import os
 
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 
 # PipeWire routing (correction-TUI craft 7d7e37af): conda-forge PortAudio ships
 # an ALSA that cannot see the system pipewire/default PCM (hw-only enumeration

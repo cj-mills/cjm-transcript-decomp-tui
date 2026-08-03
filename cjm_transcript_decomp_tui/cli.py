@@ -36,6 +36,10 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
     p.add_argument("--manifests-dir", default=None,
                    help="Capability manifests directory (default: the workspace's "
                         ".cjm/manifests when one is active, else .cjm/manifests under the cwd)")
+    p.add_argument("--proposals-dir", default=None,
+                   help="Proposal-set directory the propset picker discovers from "
+                        "(default: the workspace's proposals/ when one is active, "
+                        "else proposals/ under the cwd)")
     p.add_argument("--vad-capability", default="cjm-capability-silero-vad",
                    help="VAD capability name (forwarded to the core)")
     p.add_argument("--fa-capability", default="cjm-capability-qwen3-forced-aligner",
@@ -53,11 +57,13 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
                    help="Explicitly disable the monitor (overrides state + discovery)")
     p.add_argument("--language", default="English",
                    help="Forced-alignment language (forwarded to the core)")
-    p.add_argument("--sentence-split", action=argparse.BooleanOptionalAction, default=True,
+    p.add_argument("--sentence-split", action=argparse.BooleanOptionalAction, default=None,
                    help="Run every confirmed group with the post-FA sentence-split "
                         "stage (forwarded to the core; commits a PARALLEL spine). "
-                        "DEFAULT-ON (DEC 552bde8d); --no-sentence-split opts out. "
-                        "Also toggleable in-TUI with s on the runs stage")
+                        "Unset resolves ON (DEC 552bde8d) — unless --event-split is "
+                        "armed (verdict ad963c57 flipped the respine seam default); "
+                        "an explicit flag always wins. Also toggleable in-TUI with "
+                        "s on the runs stage")
     p.add_argument("--split-min-chunk-s", type=float, default=0.5,
                    help="Sentence-split min sub-chunk duration guard, seconds "
                         "(forwarded to the core; identity input)")
@@ -66,6 +72,19 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
                         "skeleton spine under the SAME config — the recovery for the "
                         "post-upgrade verify-collide (finding e8458f6e). Also toggleable "
                         "in-TUI with R on the runs stage")
+    p.add_argument("--event-split", action="store_true",
+                   help="Run every confirmed group with the post-FA event-carve stage "
+                        "(forwarded to the core; verdict ad963c57 — model cuts replace "
+                        "pysbd). Each run's propset resolves latest-by-source from "
+                        "--proposals-dir (E cycles alternates); also toggleable "
+                        "in-TUI with e on the runs stage")
+    p.add_argument("--event-propset", default=None,
+                   help="Explicit ProposalSetManifest pointer (manifest json or its "
+                        "set dir) — the scripted path's PIN: disables per-source "
+                        "resolution, so the batch must select exactly ONE manifest")
+    p.add_argument("--event-classes", nargs="+", default=["inhale"],
+                   help="Proposal classes that carve (forwarded to the core; default: "
+                        "inhale — word-bearing classes must never cut)")
     p.add_argument("--force", action="store_true",
                    help="Bypass capability-side caches (forwarded to the core)")
     p.add_argument("--actor", default=None,
@@ -121,6 +140,14 @@ def batch_argv(
         # Core default is OFF, so only the ON state needs rendering — but it
         # MUST render (DEC 9241564f): a fresh spine is a deliberate, visible act.
         argv += ["--respine"]
+    if args.event_split:
+        # Armed-only (core default off); the propset pointer and the carve
+        # classes render explicitly — the printed argv is the full contract.
+        # The GROUP's resolved propset wins (per-source picker, DEC ae450551);
+        # the CLI flag is the scripted path's pin.
+        argv += ["--event-split",
+                 "--event-propset", batch.get("event_propset") or args.event_propset,
+                 "--event-classes", *args.event_classes]
     if args.actor:
         argv += ["--actor", args.actor]
     return argv
@@ -129,7 +156,7 @@ def batch_argv(
 def main() -> int:  # Console-script entry point (cjm-transcript-decomp-tui)
     """Resolve settings (flags > persisted state > manifest discovery), run the
     batch app, persist the confirmed choices, then print + run each group."""
-    args = build_parser().parse_args()
+    args = resolve_split_flags(build_parser().parse_args())
     # 5daadfc4 workspace: resolve before anything reads paths; export so the
     # in-process core hand-off + capability workers are workspace-scoped.
     ws = resolve_workspace(explicit=args.workspace)
@@ -140,6 +167,9 @@ def main() -> int:  # Console-script entry point (cjm-transcript-decomp-tui)
                               if ws is not None else ".cjm/manifests")
     if args.runs_dir is None:
         args.runs_dir = str(ws.runs_dir) if ws is not None else "runs"
+    if args.proposals_dir is None:
+        args.proposals_dir = (str(ws.root / "proposals")
+                              if ws is not None else "proposals")
     state = load_state(args.manifests_dir)
     sysmon = None if args.no_sysmon else (
         args.sysmon_capability or state.get("sysmon_capability")
@@ -151,7 +181,10 @@ def main() -> int:  # Console-script entry point (cjm-transcript-decomp-tui)
                     graph_db_path=graph_db_path,
                     gap_threshold=args.gap_threshold,
                     sentence_split=args.sentence_split,
-                    respine=args.respine)
+                    respine=args.respine,
+                    proposals_dir=args.proposals_dir,
+                    event_split=args.event_split,
+                    propset_pin=args.event_propset)
     plan = app.run()
     if not plan:
         print("no batch confirmed")
@@ -159,9 +192,14 @@ def main() -> int:  # Console-script entry point (cjm-transcript-decomp-tui)
     save_state(args.manifests_dir,
                sysmon_capability=plan["sysmon_capability"],
                graph_db_path=plan["graph_db_path"])
-    # The in-TUI s/R toggles win over the launch flags (the hub path has no flags).
+    # The in-TUI s/R/e toggles win over the launch flags (the hub path has no flags).
     args.sentence_split = bool(plan.get("sentence_split"))
     args.respine = bool(plan.get("respine"))
+    args.event_split = bool(plan.get("event_split"))
+    err = event_split_batch_error(plan["batches"], args)
+    if err:
+        print(f"error: {err}")
+        return 2
     rc = 0
     for i, batch in enumerate(plan["batches"]):
         argv = batch_argv(batch, args, plan["sysmon_capability"])
@@ -173,3 +211,46 @@ def main() -> int:  # Console-script entry point (cjm-transcript-decomp-tui)
         # per group and its exit code aggregates that group's members.
         rc = max(rc, int(core_main(argv)))
     return rc
+
+
+def resolve_split_flags(args: argparse.Namespace) -> argparse.Namespace:  # The same namespace, resolved
+    """Resolve the post-parse split-flag contract (pure; main() calls it
+    BEFORE the TUI launches so a bad combination fails loud and early).
+
+    --sentence-split parses to a None sentinel: unset lands ON (DEC 552bde8d)
+    — unless --event-split is armed, where the verdict ad963c57 flipped the
+    respine seam default (sentence_split off, event_split on). An explicit
+    flag always wins: the stages stay composable (DEC 6cc10fb7), the default
+    just stopped fighting the ratified respine shape. --event-split needs no
+    pointer here — each run's propset resolves latest-by-source in the TUI
+    (DEC ae450551); a missing set fails loud at confirm and again at the
+    event_split_batch_error hand-off gate."""
+    if args.sentence_split is None:
+        args.sentence_split = not args.event_split
+    return args
+
+
+def event_split_batch_error(
+    batches: List[Dict[str, Any]],  # The confirmed plan's hand-off groups
+    args: argparse.Namespace,       # Resolved TUI args (post resolve_split_flags)
+) -> Optional[str]:  # Refusal message, or None when the hand-off is safe
+    """One propset carves ONE source: the core applies --event-propset to every
+    manifest it is handed with no source check (event_spans_from_propset loads
+    by pointer), so a mismatched hand-off would carve wrong spans SILENTLY.
+
+    Two safe shapes (DEC ae450551): (a) per-GROUP propsets from the TUI's
+    per-source picker — the propset joins the group key, so any batch width is
+    safe (each group carries its own source's set); (b) the scripted CLI pin
+    (--event-propset) — one pointer, so the batch must select exactly ONE
+    manifest. A group with NEITHER pointer has nothing to carve from: refuse."""
+    if not args.event_split:
+        return None
+    if any(not (b.get("event_propset") or args.event_propset) for b in batches):
+        return ("--event-split armed but a group has no proposal set — propose "
+                "over its source first (or pass --event-propset)")
+    if args.event_propset and not all(b.get("event_propset") for b in batches):
+        total = sum(len(b["manifests"]) for b in batches)
+        if total != 1:
+            return (f"--event-propset pins ONE set for ONE source; the confirmed "
+                    f"batch selects {total} manifests — select exactly 1")
+    return None

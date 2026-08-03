@@ -197,15 +197,29 @@ async def drive_batch(runs_dir: Path, paths: dict) -> None:
         await pilot.press("b")                         # list -> runs
         assert app.stage == "runs", app.stage
 
+        await pilot.press("e")                         # arm event-split (DEC ae450551)
+        assert app.event_split and not app.sentence_split  # seam default flip
+        body = paint()
+        assert "⚡no propset" in body, body             # no set matches the corpus
+        await pilot.press("n")                         # confirm must REFUSE
+        chip = str(app.query_one("#status", Static).render())
+        assert "no proposal set" in chip, chip         # (width may ellipsize the tail)
+        assert app.stage == "runs", app.stage
+        await pilot.press("e")                         # disarm (split stays off; s re-enables)
+        await pilot.press("s")                         # restore split for the plan
+        assert app.sentence_split
+
         await pilot.press("n")                         # confirm the batch
     plan = app.return_value
     assert plan is not None, "confirm returned no plan"
     assert plan["batches"] == [{"text_from": "cjm-capability-solo",
                                 "graph_db_path": paths["db"],
+                                "event_propset": None,
                                 "manifests": [paths["multi"], paths["single"]]}], plan
+    assert plan["event_split"] is False
     print("pilot OK: pick order, t-cycle + grouping fold, coverage chip, "
           "results drill, segments drill (gap rows + shortfall + VAD summary), "
-          "confirmed plan")
+          "event-split arm/refuse/disarm, confirmed plan")
 
 
 async def drive_windowing(runs_dir: Path) -> None:

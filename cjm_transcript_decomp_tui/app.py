@@ -24,7 +24,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import Input, Static
 
-from .runs import DecompIndex, group_batches, SourceRunIndex
+from .runs import DecompIndex, group_batches, PropsetIndex, SourceRunIndex
 from .segments import (aseg_index_for, build_display, capability_config_schema, fmt_ts, locate_span,
                        predicted_rows, probe_compare, realign_rows, SegmentStack, split_predicted,
                        vad_summary)
@@ -71,6 +71,8 @@ class DecompApp(App):
         Binding("p", "probe", "probe"),
         Binding("s", "toggle_split", "split preview", show=False),
         Binding("R", "toggle_respine", "respine", show=False),
+        Binding("e", "toggle_event_split", "event-split", show=False),
+        Binding("E", "cycle_propset", "propset", show=False),
         Binding("left_square_bracket", "speed_down", "slower", show=False,
                 key_display="["),
         Binding("right_square_bracket", "speed_up", "faster", show=False,
@@ -88,7 +90,10 @@ class DecompApp(App):
                  graph_db_path: Optional[str] = None,      # Caller-wins graph db override
                  gap_threshold: float = 2.0,               # Seconds of uncovered span that paints a gap row
                  sentence_split: bool = True,              # Seed the batch-level split toggle (DEFAULT-ON, DEC 552bde8d; s toggles)
-                 respine: bool = False):                   # Seed the batch-level respine toggle (fresh spine, same config — DEC 9241564f; R toggles)
+                 respine: bool = False,                    # Seed the batch-level respine toggle (fresh spine, same config — DEC 9241564f; R toggles)
+                 proposals_dir: str = "proposals",         # Workspace proposals/ — the propset picker's discovery root
+                 event_split: bool = False,                # Seed the batch-level event-carve toggle (e toggles; DEC ae450551)
+                 propset_pin: Optional[str] = None):       # Explicit --event-propset (pins EVERY group; per-run resolution off)
         super().__init__()
         self.respine = respine
         self.manifests_dir = manifests_dir
@@ -97,6 +102,14 @@ class DecompApp(App):
         self.graph_db_path = graph_db_path
         self.src_index = SourceRunIndex(runs_dir)
         self.dec_index = DecompIndex(runs_dir)
+        # Event-carve batch state (DEC ae450551, the hub-launch path's way in):
+        # per-run propsets resolve latest-by-source from the workspace
+        # proposals/ dir; E cycles a source's older sets; an explicit CLI pin
+        # (scripted path) short-circuits resolution entirely.
+        self.propset_index = PropsetIndex(proposals_dir)
+        self.event_split = event_split
+        self.propset_pin = propset_pin
+        self.propset_pick: Dict[str, str] = {}  # _path -> explicit E-cycle propset override
         self.stage = "runs"
         self.cursor = 0
         # The batch is keyed by manifest _path (stable across r-reloads, where
@@ -203,7 +216,7 @@ class DecompApp(App):
             status.append(f" {self.notice} ", style="cyan")
         else:
             hints = {
-                "runs": "enter/space pick · t text-from · s split · R respine · v decomp runs · r reload · n confirm · q quit",
+                "runs": "enter/space pick · t text-from · s split · R respine · e event · E propset · v decomp runs · r reload · n confirm · q quit",
                 "results": ("enter open run · j/k walk · b back · q quit"
                             if self.results_run is None
                             else "enter segments · j/k source · b decomp list · q quit"),
@@ -263,6 +276,20 @@ class DecompApp(App):
             n = self._decomp_counts.get(str(Path(key).resolve()), 0)
             if n:
                 line.append(f"  ·decomp×{n}", style="dim cyan")
+            if self.event_split:
+                # Event-armed rows carry their resolved propset (DEC ae450551):
+                # the carve input must be visible BEFORE confirm, per run.
+                ps = self._resolved_propset(m)
+                if ps is None:
+                    line.append("  ⚡no propset", style="bold red")
+                else:
+                    chosen = next((s for s in self._propsets_for(m)
+                                   if s["_path"] == ps), None)
+                    label = (PropsetIndex.summary(chosen) if chosen
+                             else tail(ps, 20))
+                    line.append(f"  ⚡{label}",
+                                style="yellow" if key in self.propset_pick
+                                else "dim magenta")
             line.truncate(width, overflow="ellipsis")
             out.append_text(line)
             out.append("\n")
@@ -305,8 +332,11 @@ class DecompApp(App):
                 out.append("  ✂ sentence-split ON", style="bold magenta")
             if self.respine:
                 out.append("  ⟳ respine ON (fresh spine, same config)", style="bold cyan")
+            if self.event_split:
+                out.append("  ⚡ event-split ON (model cuts, ad963c57)",
+                           style="bold magenta")
             out.append(":\n", style="bold")
-            for bi, ((tf, db), paths) in enumerate(batches):
+            for bi, ((tf, db, ps), paths) in enumerate(batches):
                 short = (tf or "?").removeprefix("cjm-capability-")
                 line = Text()
                 line.append(f"   {bi + 1}. text-from {short}", style="green")
@@ -316,6 +346,12 @@ class DecompApp(App):
                     line.append(f"  ⚠ db missing: {tail(db, 24)}", style="bold red")
                 else:
                     line.append(f"  db {tail(db, 24)}", style="dim")
+                if self.event_split:
+                    if ps is None:
+                        line.append("  ⚡ no propset", style="bold red")
+                    else:
+                        line.append(f"  ⚡ {Path(ps).parent.name[-12:]}",
+                                    style="dim magenta")
                 line.append(": ", style="green")
                 line.append(", ".join(self._run_id_for(p) for p in paths), style="dim")
                 line.truncate(width, overflow="ellipsis")
@@ -670,24 +706,54 @@ class DecompApp(App):
         return (self.graph_db_path
                 or SourceRunIndex.recorded_graph_db(m, self.graph_capability))
 
-    def _batches(self) -> List[Tuple[Tuple[Optional[str], Optional[str]], List[str]]]:
-        """The hand-off fold: key = (text_from, graph_db_path) — everything
-        that applies invocation-wide on the core CLI."""
-        picks: List[Tuple[str, Tuple[Optional[str], Optional[str]]]] = []
+    def _batches(self) -> List[Tuple[Tuple[Optional[str], Optional[str], Optional[str]], List[str]]]:
+        """The hand-off fold: key = (text_from, graph_db_path, event_propset) — everything
+        that applies invocation-wide on the core CLI. The propset element is
+        per-SOURCE (DEC ae450551): distinct sources resolve distinct sets, so
+        each event-armed run naturally becomes its own core invocation with
+        the right --event-propset; unarmed it is None uniformly and the fold
+        keeps its old shape."""
+        picks: List[Tuple[str, Tuple[Optional[str], Optional[str], Optional[str]]]] = []
         for key in self.picked:
             m = self._run_by_path(key)
             if m is not None:
                 picks.append((key, (self._resolved_text_from(m),
-                                    self._resolved_graph_db(m))))
+                                    self._resolved_graph_db(m),
+                                    self._resolved_propset(m) if self.event_split
+                                    else None)))
         return group_batches(picks)
 
     def _reload_indexes(self) -> None:
         self.src_index.load()
         self.dec_index.load()
+        self.propset_index.load()
         self._decomp_counts = self.dec_index.counts_by_source_manifest()
         # A reload may evict manifests the batch still names; drop those picks
         # rather than hand off paths the core would refuse.
         self.picked = [p for p in self.picked if self._run_by_path(p) is not None]
+
+    def _propsets_for(self, m: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """The focused run's candidate proposal sets, newest first (single-
+        source runs only — a propset binds ONE source, so a multi-source run
+        resolves to nothing and the confirm guard names it)."""
+        srcs = m.get("sources") or []
+        if len(srcs) != 1:
+            return []
+        s = srcs[0]
+        return self.propset_index.for_source(
+            content_hash=str(s.get("content_hash") or "") or None,
+            source_path=str(s.get("source_path") or "") or None)
+
+    def _resolved_propset(self, m: Dict[str, Any]) -> Optional[str]:
+        """The run's effective --event-propset pointer: CLI pin > E-cycle
+        override > latest-by-source (the correction lane's join rule)."""
+        if self.propset_pin:
+            return self.propset_pin
+        pick = self.propset_pick.get(m["_path"])
+        if pick:
+            return pick
+        sets = self._propsets_for(m)
+        return sets[0]["_path"] if sets else None
 
     async def _open_segments(self) -> None:
         """Drill the focused results source into its committed fine spine.
@@ -995,6 +1061,51 @@ class DecompApp(App):
                        if self.respine else "batch respine off")
         self._paint()
 
+    def action_toggle_event_split(self) -> None:
+        """e: toggle the event-carve stage batch-wide (DEC ae450551, the
+        hub-launch path's way in — the verdict ad963c57 made model cuts the
+        split authority). Arming flips sentence-split OFF (the ratified
+        respine seam default; s re-enables it explicitly — stages stay
+        composable per 6cc10fb7). Each run's propset resolves latest-by-source
+        and paints on its row; E cycles a source's older sets."""
+        if self.stage != "runs":
+            return
+        self.event_split = not self.event_split
+        if self.event_split:
+            self.sentence_split = False
+            self.notice = ("batch event-split ON (sentence-split off — the "
+                           "respine seam default; s re-enables) — rows show "
+                           "each run's resolved propset")
+        else:
+            self.notice = "batch event-split off"
+        self._paint()
+
+    def action_cycle_propset(self) -> None:
+        """E: cycle the focused run's proposal set among its source's sets
+        (newest first — older sets are earlier model generations; the t-cycle
+        precedent: the default is a convention, the override one keypress)."""
+        if self.stage != "runs" or not self.event_split or not self.src_index.runs:
+            return
+        m = self.src_index.runs[self.cursor]
+        if self.propset_pin:
+            self.notice = "propset pinned by --event-propset — E-cycle disabled"
+            self._paint()
+            return
+        sets = self._propsets_for(m)
+        if len(sets) < 2:
+            self.notice = ("no alternate proposal sets for this source"
+                           if sets else "no proposal set matches this source")
+            self._paint()
+            return
+        paths = [s["_path"] for s in sets]
+        current = self.propset_pick.get(m["_path"]) or paths[0]
+        nxt = paths[(paths.index(current) + 1) % len(paths)] \
+            if current in paths else paths[0]
+        self.propset_pick[m["_path"]] = nxt
+        chosen = next(s for s in sets if s["_path"] == nxt)
+        self.notice = f"propset → {PropsetIndex.summary(chosen)}"
+        self._paint()
+
     def action_toggle_split(self) -> None:
         """s: toggle sentence-split — the BATCH flag in RUNS (rides the plan
         into the core hand-off as --sentence-split), the probe PREVIEW in the
@@ -1192,7 +1303,7 @@ class DecompApp(App):
             self.error = "pick at least one transcription run first"
             self._paint()
             return
-        for (tf, db), paths in self._batches():
+        for (tf, db, ps), paths in self._batches():
             if db is None:
                 # Proceeding without a db is the guaranteed-wrong-graph failure
                 # the first drive hit (e087d059) — block, don't warn.
@@ -1200,13 +1311,22 @@ class DecompApp(App):
                               "— pass --graph-db-path to override")
                 self._paint()
                 return
+            if self.event_split and ps is None:
+                # The db guard's twin (DEC ae450551): an event-armed run with
+                # no source-matched propset would carve NOTHING silently (or
+                # worse, a pin would carve the WRONG source) — block, name it.
+                self.error = (f"event-split armed but no proposal set matches "
+                              f"{self._run_id_for(paths[0])} — propose over its "
+                              "source first (or e disarms)")
+                self._paint()
+                return
         if self.player is not None:
             self.player.close()
         await self._close_segments()
         self.exit({
             "batches": [{"text_from": tf, "graph_db_path": db,
-                         "manifests": list(paths)}
-                        for (tf, db), paths in self._batches()],
+                         "event_propset": ps, "manifests": list(paths)}
+                        for (tf, db, ps), paths in self._batches()],
             "runs_dir": str(self.src_index.runs_dir),
             "manifests_dir": self.manifests_dir,
             "sysmon_capability": self.sysmon_capability,
@@ -1214,6 +1334,7 @@ class DecompApp(App):
             "graph_db_path": self.graph_db_path,
             "sentence_split": self.sentence_split,
             "respine": self.respine,
+            "event_split": self.event_split,
         })
 
     async def action_quit_app(self) -> None:

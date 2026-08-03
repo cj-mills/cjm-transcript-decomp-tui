@@ -5,9 +5,11 @@ tests_manual pilot probe, per the TUI craft register)."""
 
 import json
 from pathlib import Path
-from cjm_transcript_decomp_tui.cli import batch_argv, build_parser
-from cjm_transcript_decomp_tui.runs import (DecompIndex, SourceRunIndex,
-                                            group_batches)
+from cjm_transcript_decomp_tui.cli import (batch_argv, build_parser,
+                                           event_split_batch_error,
+                                           resolve_split_flags)
+from cjm_transcript_decomp_tui.runs import (DecompIndex, PropsetIndex,
+                                            SourceRunIndex, group_batches)
 
 
 def _src_manifest(run_id, created, transcribers):
@@ -125,10 +127,11 @@ def test_provenance_reads():
 
 
 def test_batch_argv_sentence_split_passthrough():
-    # Sentence-split is DEFAULT-ON (DEC 552bde8d): a bare parse renders the
-    # explicit ON pair, and an OFF toggle must ride the argv as
-    # --no-sentence-split — the core default would silently re-enable it.
-    args = build_parser().parse_args(["--split-min-chunk-s", "0.7"])
+    # Sentence-split parses to a None sentinel and resolves ON when unset
+    # (DEC 552bde8d): the resolved args render the explicit ON pair, and an
+    # OFF toggle must ride the argv as --no-sentence-split — the core default
+    # would silently re-enable it.
+    args = resolve_split_flags(build_parser().parse_args(["--split-min-chunk-s", "0.7"]))
     assert args.sentence_split is True
     argv = batch_argv({"text_from": None, "graph_db_path": None,
                        "manifests": ["a.json"]}, args, None)
@@ -153,3 +156,102 @@ def test_batch_argv_renders_respine():
     assert not args_off.respine
     assert "--respine" not in batch_argv({"text_from": None, "graph_db_path": None,
                                           "manifests": ["a.json"]}, args_off, None)
+
+
+def test_resolve_split_flags_event_default_flip():
+    """Verdict ad963c57: --event-split flips the unset sentence-split default
+    OFF (the ratified respine shape); an explicit flag wins either way
+    (composable stages, DEC 6cc10fb7). No pointer needed at parse time —
+    per-source resolution owns it (DEC ae450551), so a bare --event-split
+    launches the TUI armed."""
+    bare = resolve_split_flags(build_parser().parse_args([]))
+    assert bare.sentence_split is True
+    armed = resolve_split_flags(build_parser().parse_args(["--event-split"]))
+    assert armed.sentence_split is False
+    assert armed.event_propset is None
+    both = resolve_split_flags(build_parser().parse_args(
+        ["--event-split", "--event-propset", "/sets/p", "--sentence-split"]))
+    assert both.sentence_split is True
+
+
+def test_batch_argv_renders_event_flags():
+    """The event trio rides the hand-off argv ONLY when armed (core default
+    off), and renders the propset pointer + carve classes explicitly — the
+    printed argv is the full reproducibility contract."""
+    args = resolve_split_flags(build_parser().parse_args(
+        ["--event-split", "--event-propset", "/sets/propset_x",
+         "--event-classes", "inhale", "exhale"]))
+    argv = batch_argv({"text_from": None, "graph_db_path": None,
+                       "manifests": ["a.json"]}, args, None)
+    assert argv[argv.index("--event-propset") + 1] == "/sets/propset_x"
+    i = argv.index("--event-classes")
+    assert argv[i + 1:i + 3] == ["inhale", "exhale"]
+    assert "--event-split" in argv
+    # The flipped default rides too: the core is sentence-split default-ON.
+    assert "--no-sentence-split" in argv
+    off = batch_argv({"text_from": None, "graph_db_path": None,
+                      "manifests": ["a.json"]},
+                     resolve_split_flags(build_parser().parse_args([])), None)
+    for flag in ("--event-split", "--event-propset", "--event-classes"):
+        assert flag not in off
+    # The GROUP's resolved propset wins over the CLI pin (per-source picker).
+    per = batch_argv({"text_from": None, "graph_db_path": None,
+                      "event_propset": "/sets/propset_y",
+                      "manifests": ["a.json"]}, args, None)
+    assert per[per.index("--event-propset") + 1] == "/sets/propset_y"
+
+
+def test_event_split_hand_off_guard():
+    """DEC ae450551: per-GROUP propsets (the per-source picker) make any batch
+    width safe; the scripted --event-propset PIN is one pointer so it demands
+    exactly one manifest; a group with neither pointer has nothing to carve
+    from and refuses — silently-wrong carves must never leave the TUI."""
+    pin = resolve_split_flags(build_parser().parse_args(
+        ["--event-split", "--event-propset", "/sets/p"]))
+    one = [{"text_from": None, "graph_db_path": None, "manifests": ["a.json"]}]
+    assert event_split_batch_error(one, pin) is None
+    wide = [{"text_from": None, "graph_db_path": None, "manifests": ["a.json"]},
+            {"text_from": "cap", "graph_db_path": None,
+             "manifests": ["b.json", "c.json"]}]
+    err = event_split_batch_error(wide, pin)
+    assert err is not None and "3 manifests" in err
+    # Per-group propsets: the same width is SAFE — each group carries its set.
+    armed = resolve_split_flags(build_parser().parse_args(["--event-split"]))
+    grouped = [{**b, "event_propset": f"/sets/p{i}"} for i, b in enumerate(wide)]
+    assert event_split_batch_error(grouped, armed) is None
+    # A group with no pointer at all refuses.
+    err = event_split_batch_error(wide, armed)
+    assert err is not None and "no proposal set" in err
+    # Unarmed, everything passes — the guard is event-split's alone.
+    plain = resolve_split_flags(build_parser().parse_args([]))
+    assert event_split_batch_error(wide, plain) is None
+
+
+def test_propset_index_discovery_and_source_join(tmp_path):
+    """PropsetIndex (DEC ae450551): format-filtered discovery under
+    proposals/, latest-per-source head, content-hash preferred over path,
+    and the tier-aware summary chip."""
+    def _set(name, created, chash, path, counts, tier2=None):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "manifest.json").write_text(json.dumps({
+            "format": "cjm-capability-pyannote/proposal-set-manifest",
+            "proposal_set_id": name, "created_at": created,
+            "source": {"path": path, "content_hash": chash},
+            "counts": counts,
+            **({"tier2_counts": tier2} if tier2 else {})}))
+    _set("propset_old", 100.0, "sha256:aaa", "/media/ep1.mp3", {"inhale": 400})
+    _set("propset_new", 200.0, "sha256:aaa", "/media/ep1.mp3",
+         {"inhale": 500}, tier2={"inhale": 27})
+    _set("propset_other", 300.0, "sha256:bbb", "/media/ep2.mp3", {"inhale": 9})
+    (tmp_path / "junk").mkdir()
+    (tmp_path / "junk" / "manifest.json").write_text("{not json")
+    idx = PropsetIndex(str(tmp_path))
+    assert idx.load() == 3
+    sets = idx.for_source(content_hash="sha256:aaa")
+    assert [m["proposal_set_id"] for m in sets] == ["propset_new", "propset_old"]
+    # Path fallback joins when no hash matches; misses return empty.
+    assert [m["proposal_set_id"] for m in idx.for_source(
+        content_hash="sha256:zzz", source_path="/media/ep2.mp3")] == ["propset_other"]
+    assert idx.for_source(content_hash="sha256:zzz") == []
+    assert PropsetIndex.summary(sets[0]) == "pset_new 500+27t2"

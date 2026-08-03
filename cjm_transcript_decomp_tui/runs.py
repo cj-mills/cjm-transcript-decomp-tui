@@ -172,3 +172,65 @@ def group_batches(
             order.append(key)
         groups[key].append(path)
     return [(key, groups[key]) for key in order]
+
+
+class PropsetIndex:
+    """Proposal-set manifests under the workspace proposals/ dir — the model's
+    source-bound durable artifacts (DEC ae450551: the pattern is source-bound
+    artifact + latest-per-source default + in-TUI pick to override, the same
+    join rule the correction lane uses). The index is capability-generic: it
+    reads the manifest's own facts (source binding, classes, counts, tiers) —
+    nothing here knows what an inhale is."""
+
+    FORMAT = "cjm-capability-pyannote/proposal-set-manifest"
+
+    def __init__(self, proposals_dir: str = "proposals"):  # Workspace proposals/ (else cwd-relative)
+        self.proposals_dir = Path(proposals_dir)
+        self.sets: List[Dict[str, Any]] = []  # Manifest dicts, newest first (+ "_path")
+
+    def load(self) -> int:  # Number of proposal sets loaded
+        """(Re)read every readable proposal-set manifest, newest first (the
+        _load_manifests forgiveness contract: unreadable/foreign jsons skip)."""
+        rows: List[Dict[str, Any]] = []
+        try:
+            files = sorted(self.proposals_dir.glob("*/manifest.json"))
+        except OSError:
+            files = []
+        for f in files:
+            try:
+                m = json.loads(f.read_text())
+            except (OSError, ValueError):
+                continue
+            if not (isinstance(m, dict) and m.get("format") == self.FORMAT):
+                continue
+            m["_path"] = str(f)
+            rows.append(m)
+        rows.sort(key=lambda m: float(m.get("created_at") or 0.0), reverse=True)
+        self.sets = rows
+        return len(rows)
+
+    def for_source(
+        self,
+        content_hash: Optional[str] = None,  # Source content hash (preferred join key)
+        source_path: Optional[str] = None,   # Source media path (fallback join key)
+    ) -> List[Dict[str, Any]]:  # Matching sets, newest first (head = the default pick)
+        """Every set proposed over a source, newest first — the head is the
+        latest-per-source default; the E-cycle walks the rest (older sets =
+        earlier model generations, still auditable)."""
+        out: List[Dict[str, Any]] = []
+        for m in self.sets:
+            src = m.get("source") or {}
+            if ((content_hash and src.get("content_hash") == content_hash)
+                    or (source_path and str(src.get("path") or "") == str(source_path))):
+                out.append(m)
+        return out
+
+    @staticmethod
+    def summary(m: Dict[str, Any]) -> str:  # One-chip description of a set
+        """The row chip's text: set id tail + per-class tier-1 counts (+ tier-2
+        total for a dual-tier set — propset manifest 0.2.0)."""
+        counts = m.get("counts") or {}
+        t2 = sum((m.get("tier2_counts") or {}).values())
+        body = "+".join(f"{v}" for v in counts.values()) or "0"
+        return (f"{str(m.get('proposal_set_id') or '?')[-8:]} "
+                f"{body}{f'+{t2}t2' if t2 else ''}")

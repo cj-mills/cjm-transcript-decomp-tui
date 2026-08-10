@@ -9,6 +9,7 @@ import os
 import shlex
 from typing import Any, Dict, List, Optional
 
+import yaml
 from cjm_substrate.core.workspace import resolve_workspace
 from cjm_transcript_decomp_core.cli import main as core_main
 
@@ -40,6 +41,14 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
                    help="Proposal-set directory the propset picker discovers from "
                         "(default: the workspace's proposals/ when one is active, "
                         "else proposals/ under the cwd)")
+    p.add_argument("--training-runs-dir", default=None,
+                   help="Training-run directory the P propose-now pre-stage discovers "
+                        "models from (default: the workspace's training-runs/ when one "
+                        "is active, else training-runs/ under the cwd)")
+    p.add_argument("--event-training-run", default=None,
+                   help="Training-run id (or id tail) P proposes with; overrides the "
+                        "workspace marker's flywheel.event_training_run pin "
+                        "(default: the pin, else the newest run behind P's confirm)")
     p.add_argument("--vad-capability", default="cjm-capability-silero-vad",
                    help="VAD capability name (forwarded to the core)")
     p.add_argument("--fa-capability", default="cjm-capability-qwen3-forced-aligner",
@@ -170,6 +179,22 @@ def main() -> int:  # Console-script entry point (cjm-transcript-decomp-tui)
     if args.proposals_dir is None:
         args.proposals_dir = (str(ws.root / "proposals")
                               if ws is not None else "proposals")
+    if args.training_runs_dir is None:
+        args.training_runs_dir = (str(ws.root / "training-runs")
+                                  if ws is not None else "training-runs")
+    # The workspace marker carries the flywheel's CURRENT-model pin as DATA
+    # (flywheel.event_training_run) — the flag wins, the pin is the standing
+    # default, absence leaves P on newest-run + its two-step confirm.
+    training_run_pin = args.event_training_run
+    if training_run_pin is None and ws is not None:
+        try:
+            marker = yaml.safe_load((ws.root / "cjm-workspace.yaml").read_text())
+        except (OSError, yaml.YAMLError):
+            marker = None
+        if isinstance(marker, dict):
+            fw = marker.get("flywheel")
+            if isinstance(fw, dict) and fw.get("event_training_run"):
+                training_run_pin = str(fw["event_training_run"])
     state = load_state(args.manifests_dir)
     sysmon = None if args.no_sysmon else (
         args.sysmon_capability or state.get("sysmon_capability")
@@ -184,7 +209,9 @@ def main() -> int:  # Console-script entry point (cjm-transcript-decomp-tui)
                     respine=args.respine,
                     proposals_dir=args.proposals_dir,
                     event_split=args.event_split,
-                    propset_pin=args.event_propset)
+                    propset_pin=args.event_propset,
+                    training_runs_dir=args.training_runs_dir,
+                    training_run_pin=training_run_pin)
     plan = app.run()
     if not plan:
         print("no batch confirmed")

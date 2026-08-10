@@ -15,16 +15,18 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from cjm_substrate.core.manager import CapabilityManager
 from cjm_substrate_tui_kit.audio import ChunkPlayer, load_chunk
 from cjm_substrate_tui_kit.form import ConfigForm
 from cjm_substrate_tui_kit.repaint import RepaintThrottle
 from cjm_substrate_tui_kit.viewport import tail, visible_slice
+from cjm_transcript_decomp_core.cli import load_capabilities
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import Input, Static
 
-from .runs import DecompIndex, group_batches, PropsetIndex, SourceRunIndex
+from .runs import DecompIndex, group_batches, PropsetIndex, SourceRunIndex, TrainingRunIndex
 from .segments import (aseg_index_for, build_display, capability_config_schema, fmt_ts, locate_span,
                        predicted_rows, probe_compare, realign_rows, SegmentStack, split_predicted,
                        vad_summary)
@@ -73,6 +75,7 @@ class DecompApp(App):
         Binding("R", "toggle_respine", "respine", show=False),
         Binding("e", "toggle_event_split", "event-split", show=False),
         Binding("E", "cycle_propset", "propset", show=False),
+        Binding("P", "propose_missing", "propose", show=False),
         Binding("left_square_bracket", "speed_down", "slower", show=False,
                 key_display="["),
         Binding("right_square_bracket", "speed_up", "faster", show=False,
@@ -93,7 +96,10 @@ class DecompApp(App):
                  respine: bool = False,                    # Seed the batch-level respine toggle (fresh spine, same config — DEC 9241564f; R toggles)
                  proposals_dir: str = "proposals",         # Workspace proposals/ — the propset picker's discovery root
                  event_split: bool = False,                # Seed the batch-level event-carve toggle (e toggles; DEC ae450551)
-                 propset_pin: Optional[str] = None):       # Explicit --event-propset (pins EVERY group; per-run resolution off)
+                 propset_pin: Optional[str] = None,        # Explicit --event-propset (pins EVERY group; per-run resolution off)
+                 training_runs_dir: str = "training-runs", # Workspace training-runs/ — P propose-now model discovery
+                 training_run_pin: Optional[str] = None,   # Marker/flag pin naming the CURRENT model (data, not code)
+                 event_capability: str = "cjm-capability-pyannote"):  # Capability serving the audio_event_detection task
         super().__init__()
         self.respine = respine
         self.manifests_dir = manifests_dir
@@ -110,6 +116,14 @@ class DecompApp(App):
         self.event_split = event_split
         self.propset_pin = propset_pin
         self.propset_pick: Dict[str, str] = {}  # _path -> explicit E-cycle propset override
+        # P propose-now pre-stage (DEC 1cfe6d0f): manifest-driven model
+        # discovery + the armed two-step confirm; the capability seat opens
+        # lazily per batch and tears down after.
+        self.trainrun_index = TrainingRunIndex(training_runs_dir)
+        self.training_run_pin = training_run_pin
+        self.event_capability = event_capability
+        self.propose_armed: Optional[Dict[str, Any]] = None  # {"run": manifest, "targets": [run manifests]}
+        self.propose_busy = False
         self.stage = "runs"
         self.cursor = 0
         # The batch is keyed by manifest _path (stable across r-reloads, where
@@ -216,7 +230,7 @@ class DecompApp(App):
             status.append(f" {self.notice} ", style="cyan")
         else:
             hints = {
-                "runs": "enter/space pick · t text-from · s split · R respine · e event · E propset · v decomp runs · r reload · n confirm · q quit",
+                "runs": "enter/space pick · t text-from · s split · R respine · e event · E propset · P propose · v decomp runs · r reload · n confirm · q quit",
                 "results": ("enter open run · j/k walk · b back · q quit"
                             if self.results_run is None
                             else "enter segments · j/k source · b decomp list · q quit"),
@@ -727,6 +741,8 @@ class DecompApp(App):
         self.src_index.load()
         self.dec_index.load()
         self.propset_index.load()
+        self.trainrun_index.load()
+        self.propose_armed = None  # any reload invalidates an armed P confirm
         self._decomp_counts = self.dec_index.counts_by_source_manifest()
         # A reload may evict manifests the batch still names; drop those picks
         # rather than hand off paths the core would refuse.
@@ -754,6 +770,109 @@ class DecompApp(App):
             return pick
         sets = self._propsets_for(m)
         return sets[0]["_path"] if sets else None
+
+    def _propose_targets(self) -> List[Dict[str, Any]]:
+        """Picked single-source runs whose source resolves NO propset — the
+        exact set the event-armed confirm guard would refuse (one target per
+        source: a propset binds the source, not the run)."""
+        out: List[Dict[str, Any]] = []
+        seen: set = set()
+        for p in self.picked:
+            m = self._run_by_path(p)
+            if m is None or self._resolved_propset(m) is not None:
+                continue
+            srcs = m.get("sources") or []
+            if len(srcs) != 1:
+                continue
+            key = str(srcs[0].get("content_hash") or srcs[0].get("source_path") or p)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(m)
+        return out
+
+    async def action_propose_missing(self) -> None:
+        """P (DEC 1cfe6d0f): the batch pre-stage — propose over every picked
+        event-armed source with no propset, through the capability task
+        channel. TWO-STEP: the first press names the resolved model and the
+        second press runs it — a wrong model burns a walk session
+        (b9717422), so the human stays between resolution and inference."""
+        if self.stage != "runs" or self.propose_busy:
+            return
+        if not self.event_split:
+            self.error = "arm event-split (e) first — P proposes for event-armed runs"
+            self._paint()
+            return
+        if self.propose_armed is not None:
+            armed, self.propose_armed = self.propose_armed, None
+            self.error = None
+            self.run_worker(self._run_propose_batch(armed["run"], armed["targets"]),
+                            exclusive=True)
+            return
+        targets = self._propose_targets()
+        if not targets:
+            self.error = ("every picked run already resolves a propset"
+                          if self.picked else
+                          "pick runs first — P proposes for the picked batch")
+            self._paint()
+            return
+        self.trainrun_index.load()
+        run = self.trainrun_index.resolve(self.training_run_pin)
+        if run is None:
+            self.error = (f"training-run pin {self.training_run_pin!r} matches nothing "
+                          f"under {self.trainrun_index.training_runs_dir}"
+                          if self.training_run_pin else
+                          f"no training runs under {self.trainrun_index.training_runs_dir}")
+            self._paint()
+            return
+        self.propose_armed = {"run": run, "targets": targets}
+        self.error = None
+        self.notice = (f"P again: propose {len(targets)} source(s) with "
+                       f"{TrainingRunIndex.summary(run)}"
+                       + ("" if self.training_run_pin else " — newest run, no pin"))
+        self._paint()
+
+    async def _run_propose_batch(self, run_m: Dict[str, Any],
+                                 targets: List[Dict[str, Any]]) -> None:
+        """The propose seat: load the event capability, run the
+        audio_event_detection task per source, tear down, re-index so the
+        ⚡chips flip. The SECOND sanctioned exception to the batch app's
+        loads-no-capability posture (after the segments drill) — a third
+        exception is the signal for a real capability-seat design (82c463fe)."""
+        self.propose_busy = True
+        manager = None
+        landed = 0
+        try:
+            self.notice = "propose: opening capability seat…"
+            self._paint()
+            manager = CapabilityManager(search_paths=[Path(self.manifests_dir)])
+            load_capabilities(manager, [self.event_capability])
+            for i, m in enumerate(targets, 1):
+                src = (m.get("sources") or [{}])[0]
+                src_path = str(src.get("source_path") or "")
+                self.notice = (f"propose {i}/{len(targets)}: {Path(src_path).name} … "
+                               "(batch pre-stage)")
+                self._paint()
+                await manager.execute_capability_task_async(
+                    self.event_capability, "audio_event_detection", "propose",
+                    training_run=run_m["_path"], source=src_path)
+                landed += 1
+            self.error = None
+            self.notice = (f"⚡ {landed} propset(s) landed with "
+                           f"{TrainingRunIndex.summary(run_m)}")
+        except (Exception, SystemExit) as e:
+            # SystemExit included: load_capabilities exits on a missing
+            # capability, and a library exit must paint, not kill the TUI.
+            self.error = f"propose failed after {landed} set(s): {e}"
+        finally:
+            if manager is not None:
+                try:
+                    manager.unload_capability(self.event_capability)
+                except Exception:
+                    self.log.error("propose seat teardown failed", exc_info=True)
+            self.propose_busy = False
+        self._reload_indexes()
+        self._paint()
 
     async def _open_segments(self) -> None:
         """Drill the focused results source into its committed fine spine.

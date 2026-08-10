@@ -268,6 +268,60 @@ def main() -> None:
         runs = Path(td) / "runs"
         runs.mkdir()
         asyncio.run(drive_windowing(runs))
+    with tempfile.TemporaryDirectory() as td:
+        runs = Path(td) / "runs"
+        write_corpus(runs)
+        asyncio.run(drive_propose_paint(runs))
+
+
+async def drive_propose_paint(runs_dir: Path) -> None:
+    """P propose-now paint path (DEC 1cfe6d0f): guard hints, the two-step
+    armed notice naming the resolved model, the failure paint when the seat
+    cannot open (no capability manifests here — the REAL propose path is the
+    task-channel smoke's job, not the pilot's), and pin-miss loudness."""
+    trd = runs_dir / "training-runs"
+    run_dir = trd / "trainrun_20260731_002436_6f803b12"
+    run_dir.mkdir(parents=True)
+    (run_dir / "manifest.json").write_text(json.dumps({
+        "format": "cjm-capability-pyannote/training-run-manifest",
+        "run_id": "trainrun_20260731_002436_6f803b12",
+        "classes": ["speech", "inhale"]}))
+    app = DecompApp(str(runs_dir / "no-manifests"), runs_dir=str(runs_dir),
+                    training_runs_dir=str(trd))
+    async with app.run_test(size=(120, 40)) as pilot:
+        def paint() -> str:
+            app._paint_now()
+            return "\n".join(str(w.render()) for w in app.query(Static))
+        await pilot.press("P")                       # unarmed: needs event-split
+        assert "arm event-split (e) first" in paint()
+        await pilot.press("e")                       # arm the batch
+        await pilot.press("P")                       # nothing picked yet
+        assert "pick runs first" in paint()
+        await pilot.press("enter")                   # pick the newest run
+        await pilot.press("P")                       # step 1: named confirm
+        body = paint()
+        assert "P again: propose 1 source(s) with 6f803b12" in body, body
+        assert "newest run, no pin" in body, body
+        await pilot.press("P")                       # step 2: seat open FAILS here
+        await pilot.pause(0.5)
+        body = paint()
+        assert "propose failed after 0 set(s)" in body, body
+        assert app.stage == "runs" and not app.propose_busy
+        await pilot.press("q")
+
+    # A pin that matches nothing is LOUD, never a silent fallback (b9717422).
+    app = DecompApp(str(runs_dir / "no-manifests"), runs_dir=str(runs_dir),
+                    training_runs_dir=str(trd), training_run_pin="deadbeef")
+    async with app.run_test(size=(120, 40)) as pilot:
+        def paint() -> str:
+            app._paint_now()
+            return "\n".join(str(w.render()) for w in app.query(Static))
+        await pilot.press("e")
+        await pilot.press("enter")
+        await pilot.press("P")
+        assert "matches nothing" in paint()
+        await pilot.press("q")
+    print("pilot OK: P propose-now guards, two-step confirm, seat-failure paint, loud pin miss")
 
 
 # Entry-point dispatch — LAST region on purpose (regions append in order, and

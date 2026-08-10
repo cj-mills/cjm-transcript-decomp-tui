@@ -234,3 +234,63 @@ class PropsetIndex:
         body = "+".join(f"{v}" for v in counts.values()) or "0"
         return (f"{str(m.get('proposal_set_id') or '?')[-8:]} "
                 f"{body}{f'+{t2}t2' if t2 else ''}")
+
+
+class TrainingRunIndex:
+    """Training-run manifests under the workspace training-runs/ dir — the
+    flywheel's model artifacts, discovered the PropsetIndex way (manifest-
+    driven, forgiveness contract, capability-generic: the index reads the
+    manifest's own facts — run id, classes, base model — and knows nothing
+    about inhales). Serves the P propose-now pre-stage (DEC 1cfe6d0f): the
+    workspace marker's flywheel.event_training_run pin names the CURRENT
+    model as DATA; without a pin the newest run is only a footer-named
+    default behind the two-step confirm — a wrong model burns a walk
+    session (b9717422), so the human stays in the loop."""
+
+    FORMAT = "cjm-capability-pyannote/training-run-manifest"
+
+    def __init__(self, training_runs_dir: str = "training-runs"):  # Workspace training-runs/ (else cwd-relative)
+        self.training_runs_dir = Path(training_runs_dir)
+        self.runs: List[Dict[str, Any]] = []  # Manifest dicts, newest first (+ "_path")
+
+    def load(self) -> int:  # Number of training runs loaded
+        """(Re)read every readable training-run manifest, newest first (run
+        ids embed mint time, so the id sort IS the recency sort)."""
+        rows: List[Dict[str, Any]] = []
+        try:
+            files = sorted(self.training_runs_dir.glob("*/manifest.json"))
+        except OSError:
+            files = []
+        for f in files:
+            try:
+                m = json.loads(f.read_text())
+            except (OSError, ValueError):
+                continue
+            if not (isinstance(m, dict) and m.get("format") == self.FORMAT):
+                continue
+            m["_path"] = str(f)
+            rows.append(m)
+        rows.sort(key=lambda m: str(m.get("run_id") or ""), reverse=True)
+        self.runs = rows
+        return len(rows)
+
+    def resolve(
+        self,
+        pin: Optional[str] = None,  # Workspace-marker pin: run id (or unambiguous id tail)
+    ) -> Optional[Dict[str, Any]]:  # The propose-now model pointer, or None
+        """Pin > newest run. A pin that matches nothing returns None LOUDLY
+        (the caller names it) — silently falling back to a different model is
+        exactly the field-failure class the register retired overlay-v1 for."""
+        if pin:
+            for m in self.runs:
+                rid = str(m.get("run_id") or "")
+                if rid == pin or rid.endswith(pin):
+                    return m
+            return None
+        return self.runs[0] if self.runs else None
+
+    @staticmethod
+    def summary(m: Dict[str, Any]) -> str:  # One-line description of a run
+        """Footer text for the two-step confirm: run id tail + trained classes."""
+        classes = ",".join(m.get("classes") or []) or "?"
+        return f"{str(m.get('run_id') or '?')[-8:]} [{classes}]"

@@ -255,3 +255,41 @@ def test_propset_index_discovery_and_source_join(tmp_path):
         content_hash="sha256:zzz", source_path="/media/ep2.mp3")] == ["propset_other"]
     assert idx.for_source(content_hash="sha256:zzz") == []
     assert PropsetIndex.summary(sets[0]) == "pset_new 500+27t2"
+
+
+def test_training_run_index_discovery_and_resolve(tmp_path):
+    """DEC 1cfe6d0f (P propose-now): manifest-driven discovery with the
+    forgiveness contract; newest-first by run id; pin > newest, and a pin
+    matching nothing returns None LOUDLY instead of silently falling back
+    to a different model (the b9717422 field-failure class)."""
+    from cjm_transcript_decomp_tui.runs import TrainingRunIndex
+    d = tmp_path / "training-runs"
+
+    def _run(run_id, classes, extra=None):
+        rd = d / run_id
+        rd.mkdir(parents=True)
+        m = {"format": TrainingRunIndex.FORMAT, "run_id": run_id, "classes": classes}
+        m.update(extra or {})
+        (rd / "manifest.json").write_text(json.dumps(m))
+
+    _run("trainrun_20260731_002436_6f803b12", ["speech", "inhale"])
+    _run("trainrun_20260805_104926_73000552", ["click", "inhale"])
+    (d / "junk").mkdir()
+    (d / "junk" / "manifest.json").write_text("{not json")
+    (d / "foreign").mkdir()
+    (d / "foreign" / "manifest.json").write_text(json.dumps({"format": "other/thing"}))
+
+    idx = TrainingRunIndex(str(d))
+    assert idx.load() == 2
+    assert idx.runs[0]["run_id"].endswith("73000552")  # newest first
+    # No pin: newest run is only a default (the two-step confirm names it)
+    assert idx.resolve()["run_id"].endswith("73000552")
+    # Pin (full id or tail) wins regardless of recency
+    assert idx.resolve("6f803b12")["run_id"].endswith("6f803b12")
+    assert idx.resolve("trainrun_20260731_002436_6f803b12")["run_id"].endswith("6f803b12")
+    # A pin matching nothing is a loud None, never a fallback
+    assert idx.resolve("deadbeef") is None
+    assert "6f803b12" in TrainingRunIndex.summary(idx.resolve("6f803b12"))
+    # Empty dir: no runs, loud None
+    empty = TrainingRunIndex(str(tmp_path / "nowhere"))
+    assert empty.load() == 0 and empty.resolve() is None

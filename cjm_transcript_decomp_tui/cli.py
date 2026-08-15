@@ -163,11 +163,34 @@ def batch_argv(
 
 
 def main() -> int:  # Console-script entry point (cjm-transcript-decomp-tui)
-    """Resolve settings (flags > persisted state > manifest discovery), run the
-    batch app, persist the confirmed choices, then print + run each group."""
+    """Resolve the shared setup surface, run the batch app, hand off — the
+    build_parser -> resolve_split_flags -> resolve_settings -> app -> hand_off
+    ladder both shells share (only the app in the middle differs)."""
     args = resolve_split_flags(build_parser().parse_args())
-    # 5daadfc4 workspace: resolve before anything reads paths; export so the
-    # in-process core hand-off + capability workers are workspace-scoped.
+    s = resolve_settings(args)
+    app = DecompApp(s["manifests_dir"], runs_dir=s["runs_dir"],
+                    sysmon_capability=s["sysmon_capability"],
+                    graph_capability=args.graph_capability,
+                    graph_db_path=s["graph_db_path"],
+                    gap_threshold=args.gap_threshold,
+                    sentence_split=args.sentence_split,
+                    respine=args.respine,
+                    proposals_dir=s["proposals_dir"],
+                    event_split=args.event_split,
+                    propset_pin=args.event_propset,
+                    training_runs_dir=s["training_runs_dir"],
+                    training_run_pin=s["training_run_pin"])
+    return hand_off(app.run(), args)
+
+
+def resolve_settings(args: argparse.Namespace) -> Dict[str, Any]:  # Resolved batch-setup surface
+    """Resolve the batch-setup settings every shell shares (flags > persisted
+    state > manifest discovery), exporting CJM_WORKSPACE so the in-process core
+    hand-off + capability workers are workspace-scoped (5daadfc4). Extracted
+    from main() so the Qt shell's driver reuses the EXACT ladder (DEC 6c574c89
+    — the dcf8a712 extraction replayed on the decomp lane): a resolution drift
+    between shells would fork the reproducibility contract. Mutates the args
+    dirs to their resolved defaults (batch_argv reads them there)."""
     ws = resolve_workspace(explicit=args.workspace)
     if ws is not None:
         os.environ["CJM_WORKSPACE"] = str(ws.root)
@@ -199,27 +222,31 @@ def main() -> int:  # Console-script entry point (cjm-transcript-decomp-tui)
     sysmon = None if args.no_sysmon else (
         args.sysmon_capability or state.get("sysmon_capability")
         or discover_capability(args.manifests_dir, "get_system_status"))
-    graph_db_path = args.graph_db_path or state.get("graph_db_path")
-    app = DecompApp(args.manifests_dir, runs_dir=args.runs_dir,
-                    sysmon_capability=sysmon,
-                    graph_capability=args.graph_capability,
-                    graph_db_path=graph_db_path,
-                    gap_threshold=args.gap_threshold,
-                    sentence_split=args.sentence_split,
-                    respine=args.respine,
-                    proposals_dir=args.proposals_dir,
-                    event_split=args.event_split,
-                    propset_pin=args.event_propset,
-                    training_runs_dir=args.training_runs_dir,
-                    training_run_pin=training_run_pin)
-    plan = app.run()
+    return {"manifests_dir": args.manifests_dir,
+            "runs_dir": args.runs_dir,
+            "proposals_dir": args.proposals_dir,
+            "training_runs_dir": args.training_runs_dir,
+            "training_run_pin": training_run_pin,
+            "sysmon_capability": sysmon,
+            "graph_db_path": args.graph_db_path or state.get("graph_db_path"),
+            "state": state}
+
+
+def hand_off(
+    plan: Optional[Dict[str, Any]],  # The app's confirmed exit plan (None = no batch)
+    args: argparse.Namespace,        # Resolved args (post resolve_split_flags/resolve_settings)
+) -> int:  # Aggregated exit code (max over the batch's core invocations)
+    """The shared driver tail: persist the confirmed choices, adopt the in-app
+    s/R/e toggles, gate the event-split hand-off, then print + run each group
+    in-process (extracted from main() alongside resolve_settings — every
+    shell's confirmed batch replays by copy-paste)."""
     if not plan:
         print("no batch confirmed")
         return 0
     save_state(args.manifests_dir,
                sysmon_capability=plan["sysmon_capability"],
                graph_db_path=plan["graph_db_path"])
-    # The in-TUI s/R/e toggles win over the launch flags (the hub path has no flags).
+    # The in-app s/R/e toggles win over the launch flags (the hub path has no flags).
     args.sentence_split = bool(plan.get("sentence_split"))
     args.respine = bool(plan.get("respine"))
     args.event_split = bool(plan.get("event_split"))

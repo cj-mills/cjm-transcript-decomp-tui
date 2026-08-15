@@ -24,7 +24,11 @@ Decomp-batch TUI driver for the transcript-decomposition workflow: browse the tr
 
 - `batch_argv` _function_ — Render one hand-off group as headless decomp-core argv.
 - `build_parser` _function_ — The TUI driver's argument surface (batch-setup options + core passthrough).
-- `main` _function_ — Resolve settings (flags > persisted state > manifest discovery), run the
+- `event_split_batch_error` _function_ — One propset carves ONE source: the core applies --event-propset to every
+- `hand_off` _function_ — The shared driver tail: persist the confirmed choices, adopt the in-app
+- `main` _function_ — Resolve the shared setup surface, run the batch app, hand off — the
+- `resolve_settings` _function_ — Resolve the batch-setup settings every shell shares (flags > persisted
+- `resolve_split_flags` _function_ — Resolve the post-parse split-flag contract (pure; main() calls it
 
 ### `cjm_transcript_decomp_tui.discovery`
 
@@ -34,7 +38,9 @@ Decomp-batch TUI driver for the transcript-decomposition workflow: browse the tr
 ### `cjm_transcript_decomp_tui.runs`
 
 - `DecompIndex` _class_ — Decomp-core run manifests read back: coverage chips for the batch stage
+- `PropsetIndex` _class_ — Proposal-set manifests under the workspace proposals/ dir — the model's
 - `SourceRunIndex` _class_ — Transcription-core run manifests — the decomp workflow's SOURCES — plus
+- `TrainingRunIndex` _class_ — Training-run manifests under the workspace training-runs/ dir — the
 - `group_batches` _function_ — Fold an ordered batch selection into headless hand-off groups.
 
 ### `cjm_transcript_decomp_tui.segments`
@@ -62,3 +68,4 @@ Decomp-batch TUI driver for the transcript-decomposition workflow: browse the tr
 ## Dependencies
 
 **Depends on:** `cjm-substrate-tui-kit`, `cjm-transcript-decomp-core`, `textual`
+**Used by:** `cjm-transcript-decomp-qt`

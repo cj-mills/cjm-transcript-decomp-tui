@@ -21,15 +21,16 @@ from cjm_substrate_tui_kit.form import ConfigForm
 from cjm_substrate_tui_kit.repaint import RepaintThrottle
 from cjm_substrate_tui_kit.viewport import tail, visible_slice
 from cjm_transcript_decomp_core.cli import load_capabilities
+from cjm_transcript_decomp_core.runs import (DecompIndex, group_batches, PropsetIndex,
+                                             SourceRunIndex, TrainingRunIndex)
+from cjm_transcript_decomp_core.segments import (aseg_index_for, build_display,
+                                                 capability_config_schema, fmt_ts, locate_span,
+                                                 predicted_rows, probe_compare, realign_rows,
+                                                 SegmentStack, split_predicted, vad_summary)
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import Input, Static
-
-from .runs import DecompIndex, group_batches, PropsetIndex, SourceRunIndex, TrainingRunIndex
-from .segments import (aseg_index_for, build_display, capability_config_schema, fmt_ts, locate_span,
-                       predicted_rows, probe_compare, realign_rows, SegmentStack, split_predicted,
-                       vad_summary)
 
 
 class DecompApp(App):
